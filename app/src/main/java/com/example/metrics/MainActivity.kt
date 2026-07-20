@@ -23,9 +23,11 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.material3.TextFieldDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -346,6 +348,27 @@ private fun LoginScreen(
     var username by remember { mutableStateOf("") }
     var password by remember { mutableStateOf("") }
     var localError by remember { mutableStateOf<String?>(null) }
+    val fieldColors = TextFieldDefaults.colors(
+        focusedTextColor = Color(0xFFEEEEEE),
+        unfocusedTextColor = Color(0xFFEEEEEE),
+        disabledTextColor = Color(0xFF777777),
+        focusedContainerColor = Color.Transparent,
+        unfocusedContainerColor = Color.Transparent,
+        disabledContainerColor = Color.Transparent,
+        cursorColor = Color(0xFFEEEEEE),
+        focusedIndicatorColor = Color(0xFFEEEEEE),
+        unfocusedIndicatorColor = Color(0xFF777777),
+        disabledIndicatorColor = Color(0xFF444444),
+        focusedLabelColor = Color(0xFFEEEEEE),
+        unfocusedLabelColor = Color(0xFFAAAAAA),
+        disabledLabelColor = Color(0xFF777777),
+    )
+    val buttonColors = ButtonDefaults.buttonColors(
+        containerColor = Color(0xFFE0E0E0),
+        contentColor = Color.Black,
+        disabledContainerColor = Color(0xFF333333),
+        disabledContentColor = Color(0xFF888888),
+    )
 
     val context = LocalContext.current
     val googleClient = remember {
@@ -391,6 +414,7 @@ private fun LoginScreen(
             enabled = !loading,
             singleLine = true,
             label = { Text("Имя") },
+            colors = fieldColors,
             modifier = Modifier.fillMaxWidth()
         )
 
@@ -403,6 +427,7 @@ private fun LoginScreen(
             singleLine = true,
             label = { Text("Пароль") },
             visualTransformation = PasswordVisualTransformation(),
+            colors = fieldColors,
             modifier = Modifier.fillMaxWidth()
         )
 
@@ -414,6 +439,7 @@ private fun LoginScreen(
                 onPasswordLogin(username.trim(), password)
             },
             enabled = !loading && username.isNotBlank() && password.isNotBlank(),
+            colors = buttonColors,
             modifier = Modifier.fillMaxWidth()
         ) {
             Text(if (loading) "Вхожу..." else "Войти")
@@ -431,6 +457,7 @@ private fun LoginScreen(
                 signInLauncher.launch(googleClient.signInIntent)
             },
             enabled = !loading,
+            colors = buttonColors,
             modifier = Modifier.fillMaxWidth()
         ) {
             Text("Войти через Google")
