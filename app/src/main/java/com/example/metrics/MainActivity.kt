@@ -12,6 +12,7 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Spacer
@@ -19,6 +20,8 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.pager.HorizontalPager
+import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.material3.Button
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
@@ -108,10 +111,15 @@ fun MetricsApp() {
     val scope = rememberCoroutineScope()
 
     var jwt by remember { mutableStateOf<String?>(null) }
-    var needsAuth by remember { mutableStateOf(false) }
+    var needsAuth by remember { mutableStateOf(true) }
     var weatherState by remember { mutableStateOf(WeatherState(loading = true)) }
 
     suspend fun load(jwtForRequest: String? = jwt) {
+        if (jwtForRequest.isNullOrBlank()) {
+            needsAuth = true
+            weatherState = WeatherState()
+            return
+        }
         weatherState = weatherState.copy(
             loading = weatherState.snapshot == null,
         )
@@ -149,7 +157,12 @@ fun MetricsApp() {
     }
 
     LaunchedEffect(Unit) {
-        jwt = getStoredJwt(context)
+        val storedJwt = getStoredJwt(context)
+        jwt = storedJwt
+        needsAuth = storedJwt == null
+        if (storedJwt == null) {
+            weatherState = WeatherState()
+        }
     }
 
     LaunchedEffect(needsAuth, jwt) {
@@ -196,7 +209,8 @@ fun MetricsApp() {
             onLogout = {
                 clearJwt(context)
                 jwt = null
-                scope.launch { load(null) }
+                needsAuth = true
+                weatherState = WeatherState()
             },
         )
     }
@@ -209,6 +223,7 @@ private fun WeatherScreen(
     onLogout: () -> Unit,
 ) {
     val snapshot = state.snapshot
+    val pagerState = rememberPagerState(pageCount = { 2 })
 
     Column(
         modifier = Modifier
@@ -218,6 +233,66 @@ private fun WeatherScreen(
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.Center
     ) {
+        val displayedLastUpdate = if (pagerState.currentPage == 0) {
+            snapshot?.lastUpdate
+        } else {
+            snapshot?.externalLastUpdate
+        }
+
+        HorizontalPager(
+            state = pagerState,
+            modifier = Modifier
+                .fillMaxWidth()
+                .weight(1f),
+        ) { page ->
+            Box(
+                modifier = Modifier.fillMaxSize(),
+                contentAlignment = Alignment.Center,
+            ) {
+                if (page == 0) {
+                    PrimarySensorCard(snapshot)
+                } else {
+                    ExternalSensorCard(snapshot)
+                }
+            }
+        }
+
+        Text(
+            text = "Обновлено: ${displayedLastUpdate ?: "-"}",
+            color = Color(0xFF777777),
+            fontSize = 18.sp
+        )
+
+        Spacer(modifier = Modifier.height(14.dp))
+
+        if (state.error != null) {
+            ErrorText(state.error)
+        }
+
+        if (pagerState.currentPage == 1 && snapshot?.externalSensorOk == false) {
+            ErrorText("Дополнительный датчик не отвечает")
+        }
+
+        if (hasToken) {
+            Spacer(modifier = Modifier.height(40.dp))
+            TextButton(onClick = onLogout, enabled = !state.loading) {
+                Text("Выйти")
+            }
+        }
+    }
+}
+
+@Composable
+private fun PrimarySensorCard(snapshot: WeatherSnapshot?) {
+    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+        Text(
+            text = "Основной датчик",
+            color = Color(0xFF777777),
+            fontSize = 18.sp
+        )
+
+        Spacer(modifier = Modifier.height(30.dp))
+
         Text(
             text = "Температура: ${snapshot?.temp ?: "..."} °C",
             color = Color(0xFFEEEEEE),
@@ -231,27 +306,33 @@ private fun WeatherScreen(
             color = Color(0xFFCCCCCC),
             fontSize = 36.sp
         )
+    }
+}
 
-        Spacer(modifier = Modifier.height(30.dp))
-
+@Composable
+private fun ExternalSensorCard(snapshot: WeatherSnapshot?) {
+    Column(horizontalAlignment = Alignment.CenterHorizontally) {
         Text(
-            text = "Обновлено: ${snapshot?.lastUpdate ?: "-"}",
+            text = "Дополнительный датчик",
             color = Color(0xFF777777),
             fontSize = 18.sp
         )
 
-        Spacer(modifier = Modifier.height(14.dp))
+        Spacer(modifier = Modifier.height(30.dp))
 
-        if (state.error != null) {
-            ErrorText(state.error)
-        }
+        Text(
+            text = "Температура: ${snapshot?.externalTemp ?: "..."} °C",
+            color = Color(0xFFEEEEEE),
+            fontSize = 36.sp
+        )
 
-        if (hasToken) {
-            Spacer(modifier = Modifier.height(40.dp))
-            TextButton(onClick = onLogout, enabled = !state.loading) {
-                Text("Выйти")
-            }
-        }
+        Spacer(modifier = Modifier.height(20.dp))
+
+        Text(
+            text = "Влажность: ${snapshot?.externalHum ?: "..."} %",
+            color = Color(0xFFCCCCCC),
+            fontSize = 36.sp
+        )
     }
 }
 
@@ -384,10 +465,29 @@ private suspend fun loadWeather(context: Context, jwt: String?): WeatherResult {
             val json = response.json
             val temp = if (json.isNull("temp")) null else formatMetricValue(json.getDouble("temp"))
             val hum = if (json.isNull("hum")) null else formatMetricValue(json.getDouble("hum"))
+            val externalTemp = if (json.isNull("external_temp")) {
+                null
+            } else {
+                formatMetricValue(json.getDouble("external_temp"))
+            }
+            val externalHum = if (json.isNull("external_hum")) {
+                null
+            } else {
+                formatMetricValue(json.getDouble("external_hum"))
+            }
             val ts = if (json.isNull("timestamp")) null else json.getLong("timestamp")
+            val externalTs = if (json.isNull("external_timestamp")) {
+                null
+            } else {
+                json.getLong("external_timestamp")
+            }
             val sensorOk = json.optBoolean(
                 "sensor_ok",
                 temp != null && hum != null && ts != null
+            )
+            val externalSensorOk = json.optBoolean(
+                "external_sensor_ok",
+                externalTemp != null && externalHum != null && externalTs != null
             )
 
             if (!sensorOk || temp == null || hum == null || ts == null) {
@@ -398,7 +498,11 @@ private suspend fun loadWeather(context: Context, jwt: String?): WeatherResult {
                     WeatherSnapshot(
                         temp = temp,
                         hum = hum,
+                        externalTemp = externalTemp,
+                        externalHum = externalHum,
+                        externalSensorOk = externalSensorOk,
                         lastUpdate = sdf.format(Date(ts * 1000)),
+                        externalLastUpdate = externalTs?.let { sdf.format(Date(it * 1000)) },
                     )
                 )
             }
@@ -504,7 +608,11 @@ private data class WeatherState(
 private data class WeatherSnapshot(
     val temp: String,
     val hum: String,
+    val externalTemp: String?,
+    val externalHum: String?,
+    val externalSensorOk: Boolean,
     val lastUpdate: String,
+    val externalLastUpdate: String?,
 )
 
 private sealed interface WeatherResult {
