@@ -11,6 +11,7 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Arrangement
@@ -38,6 +39,7 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.input.PasswordVisualTransformation
@@ -45,8 +47,10 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.google.android.gms.auth.api.signin.GoogleSignIn
+import com.google.android.gms.auth.api.signin.GoogleSignInClient
 import com.google.android.gms.auth.api.signin.GoogleSignInOptions
 import com.google.android.gms.common.api.ApiException
+import com.google.android.gms.tasks.Tasks
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -72,9 +76,13 @@ class MainActivity : ComponentActivity() {
 
 private const val AUTH_PREFS = "weather_auth"
 private const val JWT_KEY = "backend_jwt"
+private const val AUTH_PROVIDER_KEY = "auth_provider"
+private const val AUTH_PROVIDER_GOOGLE = "google"
+private const val AUTH_PROVIDER_PASSWORD = "password"
 private const val WEATHER_PATH = "/api/v1/weather/latest"
 private const val GOOGLE_AUTH_PATH = "/auth/google"
 private const val PASSWORD_AUTH_PATH = "/auth/password"
+private const val LOGOUT_PATH = "/auth/logout"
 
 private val jsonMediaType = "application/json; charset=utf-8".toMediaType()
 
@@ -92,19 +100,28 @@ private fun getStoredJwt(context: Context): String? {
         ?.takeIf { it.isNotBlank() }
 }
 
-private fun saveJwt(context: Context, jwt: String) {
+private fun saveAuthSession(context: Context, jwt: String, provider: String) {
     context
         .getSharedPreferences(AUTH_PREFS, Context.MODE_PRIVATE)
         .edit()
         .putString(JWT_KEY, jwt)
+        .putString(AUTH_PROVIDER_KEY, provider)
         .apply()
 }
 
-private fun clearJwt(context: Context) {
+private fun getStoredAuthProvider(context: Context): String? {
+    return context
+        .getSharedPreferences(AUTH_PREFS, Context.MODE_PRIVATE)
+        .getString(AUTH_PROVIDER_KEY, null)
+        ?.takeIf { it.isNotBlank() }
+}
+
+private fun clearAuthSession(context: Context) {
     context
         .getSharedPreferences(AUTH_PREFS, Context.MODE_PRIVATE)
         .edit()
         .remove(JWT_KEY)
+        .remove(AUTH_PROVIDER_KEY)
         .apply()
 }
 
@@ -117,7 +134,7 @@ fun MetricsApp() {
     var needsAuth by remember { mutableStateOf(true) }
     var weatherState by remember { mutableStateOf(WeatherState(loading = true)) }
 
-    suspend fun load(jwtForRequest: String? = jwt) {
+    suspend fun load(jwtForRequest: String? = jwt, allowGoogleRefresh: Boolean = true) {
         if (jwtForRequest.isNullOrBlank()) {
             needsAuth = true
             weatherState = WeatherState()
@@ -133,7 +150,15 @@ fun MetricsApp() {
                 weatherState = WeatherState(snapshot = result.snapshot)
             }
             WeatherResult.Unauthorized -> {
-                clearJwt(context)
+                if (allowGoogleRefresh && getStoredAuthProvider(context) == AUTH_PROVIDER_GOOGLE) {
+                    val refreshedToken = refreshGoogleBackendToken(context)
+                    if (refreshedToken != null) {
+                        jwt = refreshedToken
+                        load(refreshedToken, allowGoogleRefresh = false)
+                        return
+                    }
+                }
+                clearAuthSession(context)
                 jwt = null
                 needsAuth = true
                 weatherState = WeatherState()
@@ -186,6 +211,7 @@ fun MetricsApp() {
                         weatherState = WeatherState(error = "Неверный логин или пароль")
                         return@launch
                     }
+                    saveAuthSession(context, token, AUTH_PROVIDER_PASSWORD)
                     jwt = token
                     load(token)
                 }
@@ -195,9 +221,14 @@ fun MetricsApp() {
                     weatherState = WeatherState(loading = true)
                     val token = loginWithGoogle(context, idToken)
                     if (token == null) {
+                        signOutGoogle(context)
+                        clearAuthSession(context)
+                        jwt = null
+                        needsAuth = true
                         weatherState = WeatherState(error = "Не удалось войти через Google")
                         return@launch
                     }
+                    saveAuthSession(context, token, AUTH_PROVIDER_GOOGLE)
                     jwt = token
                     needsAuth = false
                 }
@@ -210,10 +241,17 @@ fun MetricsApp() {
             state = weatherState,
             hasToken = jwt != null,
             onLogout = {
-                clearJwt(context)
-                jwt = null
-                needsAuth = true
-                weatherState = WeatherState()
+                val token = jwt
+                scope.launch {
+                    if (!token.isNullOrBlank()) {
+                        logout(token)
+                    }
+                    signOutGoogle(context)
+                    clearAuthSession(context)
+                    jwt = null
+                    needsAuth = true
+                    weatherState = WeatherState()
+                }
             },
         )
     }
@@ -379,14 +417,7 @@ private fun LoginScreen(
     )
 
     val context = LocalContext.current
-    val googleClient = remember {
-        val optionsBuilder = GoogleSignInOptions.Builder(GoogleSignInOptions.DEFAULT_SIGN_IN)
-            .requestEmail()
-        if (BuildConfig.GOOGLE_WEB_CLIENT_ID.isNotBlank()) {
-            optionsBuilder.requestIdToken(BuildConfig.GOOGLE_WEB_CLIENT_ID)
-        }
-        GoogleSignIn.getClient(context, optionsBuilder.build())
-    }
+    val googleClient = remember { buildGoogleSignInClient(context) }
 
     val signInLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.StartActivityForResult()
@@ -419,7 +450,6 @@ private fun LoginScreen(
         OutlinedTextField(
             value = username,
             onValueChange = { username = it },
-            enabled = !loading,
             singleLine = true,
             label = { Text("Имя") },
             colors = fieldColors,
@@ -431,7 +461,6 @@ private fun LoginScreen(
         OutlinedTextField(
             value = password,
             onValueChange = { password = it },
-            enabled = !loading,
             singleLine = true,
             label = { Text("Пароль") },
             visualTransformation = PasswordVisualTransformation(),
@@ -443,20 +472,24 @@ private fun LoginScreen(
 
         Button(
             onClick = {
+                if (loading) return@Button
                 localError = null
                 onPasswordLogin(username.trim(), password)
             },
-            enabled = !loading && username.isNotBlank() && password.isNotBlank(),
+            enabled = username.isNotBlank() && password.isNotBlank(),
             colors = buttonColors,
-            modifier = Modifier.fillMaxWidth()
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(48.dp)
         ) {
-            Text(if (loading) "Вхожу..." else "Войти")
+            Text("Войти")
         }
 
         Spacer(modifier = Modifier.height(12.dp))
 
         Button(
             onClick = {
+                if (loading) return@Button
                 if (BuildConfig.GOOGLE_WEB_CLIENT_ID.isBlank()) {
                     localError = "Google OAuth client id не настроен"
                     return@Button
@@ -464,25 +497,41 @@ private fun LoginScreen(
                 localError = null
                 signInLauncher.launch(googleClient.signInIntent)
             },
-            enabled = !loading,
+            enabled = true,
             colors = buttonColors,
-            modifier = Modifier.fillMaxWidth()
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(48.dp)
         ) {
             Text("Войти через Google")
         }
 
         val message = localError ?: error
-        if (message != null) {
-            Spacer(modifier = Modifier.height(18.dp))
-            ErrorText(message)
+        val messageAlpha by animateFloatAsState(
+            targetValue = if (message != null) 1f else 0f,
+            label = "loginErrorAlpha",
+        )
+        Spacer(modifier = Modifier.height(18.dp))
+
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(64.dp),
+            contentAlignment = Alignment.Center,
+        ) {
+            ErrorText(
+                text = message ?: " ",
+                modifier = Modifier.alpha(messageAlpha),
+            )
         }
     }
 }
 
 @Composable
-private fun ErrorText(text: String) {
+private fun ErrorText(text: String, modifier: Modifier = Modifier) {
     Text(
         text = text,
+        modifier = modifier,
         color = Color.Red,
         fontSize = 18.sp,
         textAlign = TextAlign.Center
@@ -602,13 +651,62 @@ private suspend fun exchangeToken(context: Context, path: String, payload: Strin
                 if (!response.isSuccessful) return@withContext null
                 val text = response.body?.string()
                 if (text.isNullOrBlank()) return@withContext null
-                val jwt = JSONObject(text).optString("access_token").takeIf { it.isNotBlank() }
-                if (jwt != null) saveJwt(context, jwt)
-                jwt
+                JSONObject(text).optString("access_token").takeIf { it.isNotBlank() }
             }
         } catch (_: Exception) {
             null
         }
+    }
+}
+
+private suspend fun logout(jwt: String) {
+    withContext(Dispatchers.IO) {
+        try {
+            val request = Request.Builder()
+                .url(apiUrl(LOGOUT_PATH))
+                .post(ByteArray(0).toRequestBody())
+                .header("Authorization", "Bearer $jwt")
+                .build()
+
+            httpClient.newCall(request).execute().close()
+        } catch (_: Exception) {
+        }
+    }
+}
+
+private fun buildGoogleSignInClient(context: Context): GoogleSignInClient {
+    val optionsBuilder = GoogleSignInOptions.Builder(GoogleSignInOptions.DEFAULT_SIGN_IN)
+        .requestEmail()
+    if (BuildConfig.GOOGLE_WEB_CLIENT_ID.isNotBlank()) {
+        optionsBuilder.requestIdToken(BuildConfig.GOOGLE_WEB_CLIENT_ID)
+    }
+    return GoogleSignIn.getClient(context, optionsBuilder.build())
+}
+
+private suspend fun signOutGoogle(context: Context) {
+    withContext(Dispatchers.IO) {
+        try {
+            Tasks.await(buildGoogleSignInClient(context).signOut(), 5, TimeUnit.SECONDS)
+        } catch (_: Exception) {
+        }
+    }
+}
+
+private suspend fun refreshGoogleBackendToken(context: Context): String? {
+    return withContext(Dispatchers.IO) {
+        try {
+            val account = Tasks.await(
+                buildGoogleSignInClient(context).silentSignIn(),
+                5,
+                TimeUnit.SECONDS,
+            )
+            val idToken = account.idToken?.takeIf { it.isNotBlank() } ?: return@withContext null
+            loginWithGoogle(context, idToken)
+        } catch (_: Exception) {
+            null
+        }
+    }?.also { token ->
+        saveAuthSession(context, token, AUTH_PROVIDER_GOOGLE)
     }
 }
 
