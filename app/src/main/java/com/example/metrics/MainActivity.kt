@@ -19,6 +19,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.rememberPagerState
@@ -245,7 +246,7 @@ private fun WeatherScreen(
             state = pagerState,
             modifier = Modifier
                 .fillMaxWidth()
-                .weight(1f),
+                .height(260.dp),
         ) { page ->
             Box(
                 modifier = Modifier.fillMaxSize(),
@@ -265,18 +266,25 @@ private fun WeatherScreen(
             fontSize = 18.sp
         )
 
-        Spacer(modifier = Modifier.height(14.dp))
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .heightIn(min = 52.dp),
+            contentAlignment = Alignment.Center,
+        ) {
+            val errorText = state.error
+                ?: if (pagerState.currentPage == 1 && snapshot?.externalSensorOk == false) {
+                    "Дополнительный датчик не отвечает"
+                } else {
+                    null
+                }
 
-        if (state.error != null) {
-            ErrorText(state.error)
-        }
-
-        if (pagerState.currentPage == 1 && snapshot?.externalSensorOk == false) {
-            ErrorText("Дополнительный датчик не отвечает")
+            if (errorText != null) {
+                ErrorText(errorText)
+            }
         }
 
         if (hasToken) {
-            Spacer(modifier = Modifier.height(40.dp))
             TextButton(onClick = onLogout, enabled = !state.loading) {
                 Text("Выйти")
             }
