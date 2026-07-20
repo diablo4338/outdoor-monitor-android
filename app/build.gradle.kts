@@ -1,7 +1,40 @@
+import org.jetbrains.kotlin.gradle.dsl.JvmTarget
+import java.util.Properties
+
 plugins {
     alias(libs.plugins.android.application)
-    alias(libs.plugins.kotlin.android)
     alias(libs.plugins.kotlin.compose)
+}
+
+val localProperties = Properties().apply {
+    val file = rootProject.file("local.properties")
+    if (file.exists()) {
+        file.inputStream().use(::load)
+    }
+}
+
+fun envValue(name: String): String? {
+    return (project.findProperty(name) as String?)
+        ?: localProperties.getProperty(name)
+        ?: System.getenv(name)
+}
+
+fun requiredEnvValue(name: String): String {
+    return envValue(name)
+        ?: error("Missing $name. Set it in MyApplication/local.properties, environment, or pass -P$name=...")
+}
+
+fun buildConfigString(value: String): String {
+    val escaped = value
+        .replace("\\", "\\\\")
+        .replace("\"", "\\\"")
+    return "\"$escaped\""
+}
+
+fun requiredEnvInt(name: String): Int {
+    val value = requiredEnvValue(name)
+    return value.toIntOrNull()
+        ?: error("$name must be an integer, got '$value'")
 }
 
 android {
@@ -20,7 +53,40 @@ android {
 
 
     buildTypes {
+        debug {
+            buildConfigField(
+                "String",
+                "API_BASE_URL",
+                buildConfigString(requiredEnvValue("DEBUG_API_BASE_URL"))
+            )
+            buildConfigField(
+                "String",
+                "GOOGLE_WEB_CLIENT_ID",
+                buildConfigString(requiredEnvValue("GOOGLE_WEB_CLIENT_ID"))
+            )
+            buildConfigField(
+                "int",
+                "POLL_INTERVAL_SECONDS",
+                requiredEnvInt("POLL_INTERVAL_SECONDS").toString()
+            )
+        }
+
         release {
+            buildConfigField(
+                "String",
+                "API_BASE_URL",
+                buildConfigString(requiredEnvValue("RELEASE_API_BASE_URL"))
+            )
+            buildConfigField(
+                "String",
+                "GOOGLE_WEB_CLIENT_ID",
+                buildConfigString(requiredEnvValue("GOOGLE_WEB_CLIENT_ID"))
+            )
+            buildConfigField(
+                "int",
+                "POLL_INTERVAL_SECONDS",
+                requiredEnvInt("POLL_INTERVAL_SECONDS").toString()
+            )
             isMinifyEnabled = true       // хочешь обфускацию — скажи
             isShrinkResources = true
             proguardFiles(
@@ -36,12 +102,21 @@ android {
         targetCompatibility = JavaVersion.VERSION_11
     }
 
-    kotlinOptions {
-        jvmTarget = "11"
-    }
-
     buildFeatures {
         compose = true
+        buildConfig = true
+    }
+
+    packaging {
+        jniLibs {
+            keepDebugSymbols += "**/libandroidx.graphics.path.so"
+        }
+    }
+}
+
+kotlin {
+    compilerOptions {
+        jvmTarget.set(JvmTarget.JVM_11)
     }
 }
 
@@ -84,4 +159,5 @@ dependencies {
 
     // Твоя сеть
     implementation("com.squareup.okhttp3:okhttp:4.11.0")
+    implementation("com.google.android.gms:play-services-auth:21.2.0")
 }
