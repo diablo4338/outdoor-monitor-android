@@ -31,6 +31,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TextFieldDefaults
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -51,19 +52,31 @@ import com.google.android.gms.auth.api.signin.GoogleSignInClient
 import com.google.android.gms.auth.api.signin.GoogleSignInOptions
 import com.google.android.gms.common.api.ApiException
 import com.google.android.gms.tasks.Tasks
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
+import org.json.JSONException
 import org.json.JSONObject
+import java.io.IOException
+import java.net.ConnectException
+import java.net.NoRouteToHostException
+import java.net.SocketTimeoutException
+import java.net.UnknownHostException
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.concurrent.ExecutionException
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.TimeoutException
+import javax.net.ssl.SSLException
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -133,6 +146,30 @@ fun MetricsApp() {
     var jwt by remember { mutableStateOf<String?>(null) }
     var needsAuth by remember { mutableStateOf(true) }
     var weatherState by remember { mutableStateOf(WeatherState(loading = true)) }
+    var appInForeground by remember { mutableStateOf(false) }
+
+    DisposableEffect(context) {
+        val lifecycle = (context as? ComponentActivity)?.lifecycle
+            ?: return@DisposableEffect onDispose {}
+
+        fun updateForegroundState() {
+            appInForeground = lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)
+        }
+
+        updateForegroundState()
+        val observer = LifecycleEventObserver { _, event ->
+            when (event) {
+                Lifecycle.Event.ON_START -> appInForeground = true
+                Lifecycle.Event.ON_STOP -> appInForeground = false
+                else -> updateForegroundState()
+            }
+        }
+
+        lifecycle.addObserver(observer)
+        onDispose {
+            lifecycle.removeObserver(observer)
+        }
+    }
 
     suspend fun load(jwtForRequest: String? = jwt, allowGoogleRefresh: Boolean = true) {
         if (jwtForRequest.isNullOrBlank()) {
@@ -163,16 +200,10 @@ fun MetricsApp() {
                 needsAuth = true
                 weatherState = WeatherState()
             }
-            WeatherResult.NoInternet -> {
+            is WeatherResult.Failure -> {
                 weatherState = WeatherState(
                     snapshot = weatherState.snapshot,
-                    error = "Нет интернета - данные не обновлены",
-                )
-            }
-            WeatherResult.ServerError -> {
-                weatherState = WeatherState(
-                    snapshot = weatherState.snapshot,
-                    error = "Сервер с метриками не отвечает",
+                    error = result.message,
                 )
             }
             WeatherResult.SensorError -> {
@@ -193,8 +224,8 @@ fun MetricsApp() {
         }
     }
 
-    LaunchedEffect(needsAuth, jwt) {
-        if (needsAuth) return@LaunchedEffect
+    LaunchedEffect(needsAuth, jwt, appInForeground) {
+        if (needsAuth || !appInForeground) return@LaunchedEffect
         while (true) {
             load(jwt)
             delay(BuildConfig.POLL_INTERVAL_SECONDS * 1_000L)
@@ -206,31 +237,47 @@ fun MetricsApp() {
             onPasswordLogin = { username, password ->
                 scope.launch {
                     weatherState = WeatherState(loading = true)
-                    val token = loginWithPassword(context, username, password)
-                    if (token == null) {
-                        weatherState = WeatherState(error = "Неверный логин или пароль")
-                        return@launch
+                    when (val result = loginWithPassword(username, password)) {
+                        AuthResult.InvalidCredentials -> {
+                            weatherState = WeatherState(error = "Неверный логин или пароль")
+                            return@launch
+                        }
+                        is AuthResult.Failure -> {
+                            weatherState = WeatherState(error = result.message)
+                            return@launch
+                        }
+                        is AuthResult.Success -> {
+                            saveAuthSession(context, result.token, AUTH_PROVIDER_PASSWORD)
+                            jwt = result.token
+                            load(result.token)
+                        }
                     }
-                    saveAuthSession(context, token, AUTH_PROVIDER_PASSWORD)
-                    jwt = token
-                    load(token)
                 }
             },
             onGoogleLogin = { idToken ->
                 scope.launch {
                     weatherState = WeatherState(loading = true)
-                    val token = loginWithGoogle(context, idToken)
-                    if (token == null) {
-                        signOutGoogle(context)
-                        clearAuthSession(context)
-                        jwt = null
-                        needsAuth = true
-                        weatherState = WeatherState(error = "Не удалось войти через Google")
-                        return@launch
+                    when (val result = loginWithGoogle(idToken)) {
+                        is AuthResult.Success -> {
+                            saveAuthSession(context, result.token, AUTH_PROVIDER_GOOGLE)
+                            jwt = result.token
+                            needsAuth = false
+                        }
+                        AuthResult.InvalidCredentials,
+                        is AuthResult.Failure -> {
+                            val message = when (result) {
+                                AuthResult.InvalidCredentials -> "Google token отклонен backend"
+                                is AuthResult.Failure -> result.message
+                                is AuthResult.Success -> "Не удалось войти через Google"
+                            }
+                            signOutGoogle(context)
+                            clearAuthSession(context)
+                            jwt = null
+                            needsAuth = true
+                            weatherState = WeatherState(error = message)
+                            return@launch
+                        }
                     }
-                    saveAuthSession(context, token, AUTH_PROVIDER_GOOGLE)
-                    jwt = token
-                    needsAuth = false
                 }
             },
             error = weatherState.error,
@@ -539,56 +586,57 @@ private fun ErrorText(text: String, modifier: Modifier = Modifier) {
 }
 
 private suspend fun loadWeather(context: Context, jwt: String?): WeatherResult {
-    if (!hasInternet(context)) return WeatherResult.NoInternet
-
     return when (val response = fetchWeatherMetrics(jwt)) {
         FetchResponse.Unauthorized -> WeatherResult.Unauthorized
-        FetchResponse.NetworkError -> WeatherResult.ServerError
-        FetchResponse.Timeout -> WeatherResult.ServerError
+        is FetchResponse.Failure -> WeatherResult.Failure(response.toUserMessage(context))
         is FetchResponse.Success -> {
             val json = response.json
-            val temp = if (json.isNull("temp")) null else formatMetricValue(json.getDouble("temp"))
-            val hum = if (json.isNull("hum")) null else formatMetricValue(json.getDouble("hum"))
-            val externalTemp = if (json.isNull("external_temp")) {
-                null
-            } else {
-                formatMetricValue(json.getDouble("external_temp"))
-            }
-            val externalHum = if (json.isNull("external_hum")) {
-                null
-            } else {
-                formatMetricValue(json.getDouble("external_hum"))
-            }
-            val ts = if (json.isNull("timestamp")) null else json.getLong("timestamp")
-            val externalTs = if (json.isNull("external_timestamp")) {
-                null
-            } else {
-                json.getLong("external_timestamp")
-            }
-            val sensorOk = json.optBoolean(
-                "sensor_ok",
-                temp != null && hum != null && ts != null
-            )
-            val externalSensorOk = json.optBoolean(
-                "external_sensor_ok",
-                externalTemp != null && externalHum != null && externalTs != null
-            )
-
-            if (!sensorOk || temp == null || hum == null || ts == null) {
-                WeatherResult.SensorError
-            } else {
-                val sdf = SimpleDateFormat("dd.MM.yyyy HH:mm:ss", Locale.getDefault())
-                WeatherResult.Success(
-                    WeatherSnapshot(
-                        temp = temp,
-                        hum = hum,
-                        externalTemp = externalTemp,
-                        externalHum = externalHum,
-                        externalSensorOk = externalSensorOk,
-                        lastUpdate = sdf.format(Date(ts * 1000)),
-                        externalLastUpdate = externalTs?.let { sdf.format(Date(it * 1000)) },
-                    )
+            try {
+                val temp = if (json.isNull("temp")) null else formatMetricValue(json.getDouble("temp"))
+                val hum = if (json.isNull("hum")) null else formatMetricValue(json.getDouble("hum"))
+                val externalTemp = if (json.isNull("external_temp")) {
+                    null
+                } else {
+                    formatMetricValue(json.getDouble("external_temp"))
+                }
+                val externalHum = if (json.isNull("external_hum")) {
+                    null
+                } else {
+                    formatMetricValue(json.getDouble("external_hum"))
+                }
+                val ts = if (json.isNull("timestamp")) null else json.getLong("timestamp")
+                val externalTs = if (json.isNull("external_timestamp")) {
+                    null
+                } else {
+                    json.getLong("external_timestamp")
+                }
+                val sensorOk = json.optBoolean(
+                    "sensor_ok",
+                    temp != null && hum != null && ts != null
                 )
+                val externalSensorOk = json.optBoolean(
+                    "external_sensor_ok",
+                    externalTemp != null && externalHum != null && externalTs != null
+                )
+
+                if (!sensorOk || temp == null || hum == null || ts == null) {
+                    WeatherResult.SensorError
+                } else {
+                    val sdf = SimpleDateFormat("dd.MM.yyyy HH:mm:ss", Locale.getDefault())
+                    WeatherResult.Success(
+                        WeatherSnapshot(
+                            temp = temp,
+                            hum = hum,
+                            externalTemp = externalTemp,
+                            externalHum = externalHum,
+                            externalSensorOk = externalSensorOk,
+                            lastUpdate = sdf.format(Date(ts * 1000)),
+                            externalLastUpdate = externalTs?.let { sdf.format(Date(it * 1000)) },
+                        )
+                    )
+                }
+            } catch (_: JSONException) {
+                WeatherResult.Failure("Backend вернул некорректные данные")
             }
         }
     }
@@ -596,9 +644,10 @@ private suspend fun loadWeather(context: Context, jwt: String?): WeatherResult {
 
 private suspend fun fetchWeatherMetrics(jwt: String?): FetchResponse {
     return withContext(Dispatchers.IO) {
+        val requestUrl = apiUrl(WEATHER_PATH)
         try {
             val requestBuilder = Request.Builder()
-                .url(apiUrl(WEATHER_PATH))
+                .url(requestUrl)
                 .get()
 
             if (!jwt.isNullOrBlank()) {
@@ -608,53 +657,97 @@ private suspend fun fetchWeatherMetrics(jwt: String?): FetchResponse {
             httpClient.newCall(requestBuilder.build()).execute().use { response ->
                 when {
                     response.code == 401 -> FetchResponse.Unauthorized
-                    !response.isSuccessful -> FetchResponse.NetworkError
+                    !response.isSuccessful -> FetchResponse.Failure.HttpStatus(response.code)
                     else -> {
                         val text = response.body?.string()
-                        if (text.isNullOrBlank()) FetchResponse.NetworkError
-                        else FetchResponse.Success(JSONObject(text))
+                        if (text.isNullOrBlank()) {
+                            FetchResponse.Failure.EmptyBody
+                        } else {
+                            try {
+                                FetchResponse.Success(JSONObject(text))
+                            } catch (_: JSONException) {
+                                FetchResponse.Failure.InvalidJson
+                            }
+                        }
                     }
                 }
             }
-        } catch (_: java.io.InterruptedIOException) {
-            FetchResponse.Timeout
-        } catch (_: Exception) {
-            FetchResponse.NetworkError
+        } catch (_: UnknownHostException) {
+            FetchResponse.Failure.UnknownHost(requestUrl.hostLabel())
+        } catch (_: SocketTimeoutException) {
+            FetchResponse.Failure.Timeout
+        } catch (_: ConnectException) {
+            FetchResponse.Failure.BackendUnavailable(requestUrl.hostLabel())
+        } catch (_: NoRouteToHostException) {
+            FetchResponse.Failure.BackendUnavailable(requestUrl.hostLabel())
+        } catch (_: SSLException) {
+            FetchResponse.Failure.Tls
+        } catch (_: IOException) {
+            FetchResponse.Failure.Io
+        } catch (_: IllegalArgumentException) {
+            FetchResponse.Failure.InvalidUrl
         }
     }
 }
 
-private suspend fun loginWithGoogle(context: Context, idToken: String): String? {
+private suspend fun loginWithGoogle(idToken: String): AuthResult {
     val payload = JSONObject()
         .put("id_token", idToken)
         .toString()
-    return exchangeToken(context, GOOGLE_AUTH_PATH, payload)
+    return exchangeToken(GOOGLE_AUTH_PATH, payload)
 }
 
-private suspend fun loginWithPassword(context: Context, username: String, password: String): String? {
+private suspend fun loginWithPassword(username: String, password: String): AuthResult {
     val payload = JSONObject()
         .put("username", username)
         .put("password", password)
         .toString()
-    return exchangeToken(context, PASSWORD_AUTH_PATH, payload)
+    return exchangeToken(PASSWORD_AUTH_PATH, payload)
 }
 
-private suspend fun exchangeToken(context: Context, path: String, payload: String): String? {
+private suspend fun exchangeToken(path: String, payload: String): AuthResult {
     return withContext(Dispatchers.IO) {
+        val requestUrl = apiUrl(path)
         try {
             val request = Request.Builder()
-                .url(apiUrl(path))
+                .url(requestUrl)
                 .post(payload.toRequestBody(jsonMediaType))
                 .build()
 
             httpClient.newCall(request).execute().use { response ->
-                if (!response.isSuccessful) return@withContext null
+                if (response.code == 401 || response.code == 403) {
+                    return@withContext AuthResult.InvalidCredentials
+                }
+                if (!response.isSuccessful) {
+                    return@withContext AuthResult.Failure("Backend вернул HTTP ${response.code} при входе")
+                }
                 val text = response.body?.string()
-                if (text.isNullOrBlank()) return@withContext null
-                JSONObject(text).optString("access_token").takeIf { it.isNotBlank() }
+                if (text.isNullOrBlank()) {
+                    return@withContext AuthResult.Failure("Backend вернул пустой ответ при входе")
+                }
+                val token = try {
+                    JSONObject(text).optString("access_token")
+                } catch (_: JSONException) {
+                    return@withContext AuthResult.Failure("Backend вернул некорректный JSON при входе")
+                }
+                token.takeIf { it.isNotBlank() }
+                    ?.let { AuthResult.Success(it) }
+                    ?: AuthResult.Failure("Backend не вернул access_token")
             }
-        } catch (_: Exception) {
-            null
+        } catch (_: UnknownHostException) {
+            AuthResult.Failure("Backend host не найден: ${requestUrl.hostLabel()}")
+        } catch (_: SocketTimeoutException) {
+            AuthResult.Failure("Backend не ответил за 5 секунд")
+        } catch (_: ConnectException) {
+            AuthResult.Failure("Backend недоступен: ${requestUrl.hostLabel()}")
+        } catch (_: NoRouteToHostException) {
+            AuthResult.Failure("Нет маршрута до backend: ${requestUrl.hostLabel()}")
+        } catch (_: SSLException) {
+            AuthResult.Failure("TLS/SSL ошибка при подключении к backend")
+        } catch (_: IOException) {
+            AuthResult.Failure("Ошибка сети при подключении к backend")
+        } catch (_: IllegalArgumentException) {
+            AuthResult.Failure("Некорректный API_BASE_URL")
         }
     }
 }
@@ -669,7 +762,8 @@ private suspend fun logout(jwt: String) {
                 .build()
 
             httpClient.newCall(request).execute().close()
-        } catch (_: Exception) {
+        } catch (_: IOException) {
+        } catch (_: IllegalArgumentException) {
         }
     }
 }
@@ -687,7 +781,10 @@ private suspend fun signOutGoogle(context: Context) {
     withContext(Dispatchers.IO) {
         try {
             Tasks.await(buildGoogleSignInClient(context).signOut(), 5, TimeUnit.SECONDS)
-        } catch (_: Exception) {
+        } catch (_: ExecutionException) {
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+        } catch (_: TimeoutException) {
         }
     }
 }
@@ -701,8 +798,17 @@ private suspend fun refreshGoogleBackendToken(context: Context): String? {
                 TimeUnit.SECONDS,
             )
             val idToken = account.idToken?.takeIf { it.isNotBlank() } ?: return@withContext null
-            loginWithGoogle(context, idToken)
-        } catch (_: Exception) {
+            when (val result = loginWithGoogle(idToken)) {
+                is AuthResult.Success -> result.token
+                AuthResult.InvalidCredentials,
+                is AuthResult.Failure -> null
+            }
+        } catch (_: ExecutionException) {
+            null
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+            null
+        } catch (_: TimeoutException) {
             null
         }
     }?.also { token ->
@@ -721,11 +827,40 @@ private fun readGoogleIdToken(data: Intent?): String? {
     }
 }
 
-private fun hasInternet(context: Context): Boolean {
+private fun hasValidatedInternet(context: Context): Boolean {
     val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
     val net = cm.activeNetwork ?: return false
     val caps = cm.getNetworkCapabilities(net) ?: return false
     return caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+        && caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
+}
+
+private fun FetchResponse.Failure.toUserMessage(context: Context): String {
+    return when (this) {
+        FetchResponse.Failure.EmptyBody -> "Backend вернул пустой ответ"
+        FetchResponse.Failure.InvalidJson -> "Backend вернул некорректный JSON"
+        FetchResponse.Failure.InvalidUrl -> "Некорректный API_BASE_URL"
+        FetchResponse.Failure.Io -> {
+            if (hasValidatedInternet(context)) {
+                "Ошибка сети при подключении к backend"
+            } else {
+                "Нет валидного интернета - данные не обновлены"
+            }
+        }
+        FetchResponse.Failure.Timeout -> "Backend не ответил за 5 секунд"
+        FetchResponse.Failure.Tls -> "TLS/SSL ошибка при подключении к backend"
+        is FetchResponse.Failure.BackendUnavailable -> "Backend недоступен: $host"
+        is FetchResponse.Failure.HttpStatus -> "Backend вернул HTTP $code"
+        is FetchResponse.Failure.UnknownHost -> "Backend host не найден: $host"
+    }
+}
+
+private fun String.hostLabel(): String {
+    return toHttpUrlOrNull()?.let { url ->
+        val defaultPort = (url.scheme == "http" && url.port == 80) ||
+            (url.scheme == "https" && url.port == 443)
+        if (defaultPort) url.host else "${url.host}:${url.port}"
+    } ?: BuildConfig.API_BASE_URL
 }
 
 private fun formatMetricValue(value: Double): String {
@@ -751,14 +886,28 @@ private data class WeatherSnapshot(
 private sealed interface WeatherResult {
     data class Success(val snapshot: WeatherSnapshot) : WeatherResult
     data object Unauthorized : WeatherResult
-    data object NoInternet : WeatherResult
-    data object ServerError : WeatherResult
+    data class Failure(val message: String) : WeatherResult
     data object SensorError : WeatherResult
 }
 
 private sealed interface FetchResponse {
     data class Success(val json: JSONObject) : FetchResponse
     data object Unauthorized : FetchResponse
-    data object Timeout : FetchResponse
-    data object NetworkError : FetchResponse
+    sealed interface Failure : FetchResponse {
+        data object EmptyBody : Failure
+        data object InvalidJson : Failure
+        data object InvalidUrl : Failure
+        data object Io : Failure
+        data object Timeout : Failure
+        data object Tls : Failure
+        data class BackendUnavailable(val host: String) : Failure
+        data class HttpStatus(val code: Int) : Failure
+        data class UnknownHost(val host: String) : Failure
+    }
+}
+
+private sealed interface AuthResult {
+    data class Success(val token: String) : AuthResult
+    data object InvalidCredentials : AuthResult
+    data class Failure(val message: String) : AuthResult
 }
