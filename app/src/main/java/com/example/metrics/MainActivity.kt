@@ -31,7 +31,6 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TextFieldDefaults
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -53,7 +52,7 @@ import com.google.android.gms.auth.api.signin.GoogleSignInOptions
 import com.google.android.gms.common.api.ApiException
 import com.google.android.gms.tasks.Tasks
 import androidx.lifecycle.Lifecycle
-import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.repeatOnLifecycle
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -142,38 +141,13 @@ private fun clearAuthSession(context: Context) {
 fun MetricsApp() {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
+    val lifecycle = (context as ComponentActivity).lifecycle
 
-    var jwt by remember { mutableStateOf<String?>(null) }
-    var needsAuth by remember { mutableStateOf(true) }
-    var weatherState by remember { mutableStateOf(WeatherState(loading = true)) }
-    var appInForeground by remember { mutableStateOf(false) }
-
-    DisposableEffect(context) {
-        val lifecycle = (context as? ComponentActivity)?.lifecycle
-            ?: return@DisposableEffect onDispose {}
-
-        fun updateForegroundState() {
-            appInForeground = lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)
-        }
-
-        updateForegroundState()
-        val observer = LifecycleEventObserver { _, event ->
-            when (event) {
-                Lifecycle.Event.ON_START -> appInForeground = true
-                Lifecycle.Event.ON_STOP -> appInForeground = false
-                else -> updateForegroundState()
-            }
-        }
-
-        lifecycle.addObserver(observer)
-        onDispose {
-            lifecycle.removeObserver(observer)
-        }
-    }
+    var jwt by remember(context) { mutableStateOf(getStoredJwt(context)) }
+    var weatherState by remember { mutableStateOf(WeatherState()) }
 
     suspend fun load(jwtForRequest: String? = jwt, allowGoogleRefresh: Boolean = true) {
         if (jwtForRequest.isNullOrBlank()) {
-            needsAuth = true
             weatherState = WeatherState()
             return
         }
@@ -183,7 +157,6 @@ fun MetricsApp() {
         val result = loadWeather(context, jwtForRequest)
         when (result) {
             is WeatherResult.Success -> {
-                needsAuth = false
                 weatherState = WeatherState(snapshot = result.snapshot)
             }
             WeatherResult.Unauthorized -> {
@@ -197,7 +170,6 @@ fun MetricsApp() {
                 }
                 clearAuthSession(context)
                 jwt = null
-                needsAuth = true
                 weatherState = WeatherState()
             }
             is WeatherResult.Failure -> {
@@ -215,24 +187,17 @@ fun MetricsApp() {
         }
     }
 
-    LaunchedEffect(Unit) {
-        val storedJwt = getStoredJwt(context)
-        jwt = storedJwt
-        needsAuth = storedJwt == null
-        if (storedJwt == null) {
-            weatherState = WeatherState()
+    LaunchedEffect(jwt, lifecycle) {
+        val pollingJwt = jwt?.takeIf { it.isNotBlank() } ?: return@LaunchedEffect
+        lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
+            while (true) {
+                load(pollingJwt)
+                delay(BuildConfig.POLL_INTERVAL_SECONDS * 1_000L)
+            }
         }
     }
 
-    LaunchedEffect(needsAuth, jwt, appInForeground) {
-        if (needsAuth || !appInForeground) return@LaunchedEffect
-        while (true) {
-            load(jwt)
-            delay(BuildConfig.POLL_INTERVAL_SECONDS * 1_000L)
-        }
-    }
-
-    if (needsAuth) {
+    if (jwt.isNullOrBlank()) {
         LoginScreen(
             onPasswordLogin = { username, password ->
                 scope.launch {
@@ -261,7 +226,6 @@ fun MetricsApp() {
                         is AuthResult.Success -> {
                             saveAuthSession(context, result.token, AUTH_PROVIDER_GOOGLE)
                             jwt = result.token
-                            needsAuth = false
                         }
                         AuthResult.InvalidCredentials,
                         is AuthResult.Failure -> {
@@ -273,7 +237,6 @@ fun MetricsApp() {
                             signOutGoogle(context)
                             clearAuthSession(context)
                             jwt = null
-                            needsAuth = true
                             weatherState = WeatherState(error = message)
                             return@launch
                         }
@@ -296,7 +259,6 @@ fun MetricsApp() {
                     signOutGoogle(context)
                     clearAuthSession(context)
                     jwt = null
-                    needsAuth = true
                     weatherState = WeatherState()
                 }
             },
@@ -358,7 +320,11 @@ private fun WeatherScreen(
             contentAlignment = Alignment.Center,
         ) {
             val errorText = state.error
-                ?: if (pagerState.currentPage == 1 && snapshot?.externalSensorOk == false) {
+                ?: if (
+                    pagerState.currentPage == 1
+                    && snapshot != null
+                    && (snapshot.externalTemp == null || snapshot.externalHum == null)
+                ) {
                     "Дополнительный датчик не отвечает"
                 } else {
                     null
@@ -604,22 +570,17 @@ private suspend fun loadWeather(context: Context, jwt: String?): WeatherResult {
                 } else {
                     formatMetricValue(json.getDouble("external_hum"))
                 }
-                val ts = if (json.isNull("timestamp")) null else json.getLong("timestamp")
-                val externalTs = if (json.isNull("external_timestamp")) {
+                val metricTimestamp = if (json.isNull("metric_timestamp")) {
                     null
                 } else {
-                    json.getLong("external_timestamp")
+                    json.getLong("metric_timestamp")
                 }
-                val sensorOk = json.optBoolean(
-                    "sensor_ok",
-                    temp != null && hum != null && ts != null
-                )
-                val externalSensorOk = json.optBoolean(
-                    "external_sensor_ok",
-                    externalTemp != null && externalHum != null && externalTs != null
-                )
-
-                if (!sensorOk || temp == null || hum == null || ts == null) {
+                val externalMetricTimestamp = if (json.isNull("external_metric_timestamp")) {
+                    null
+                } else {
+                    json.getLong("external_metric_timestamp")
+                }
+                if (temp == null || hum == null) {
                     WeatherResult.SensorError
                 } else {
                     val sdf = SimpleDateFormat("dd.MM.yyyy HH:mm:ss", Locale.getDefault())
@@ -629,9 +590,10 @@ private suspend fun loadWeather(context: Context, jwt: String?): WeatherResult {
                             hum = hum,
                             externalTemp = externalTemp,
                             externalHum = externalHum,
-                            externalSensorOk = externalSensorOk,
-                            lastUpdate = sdf.format(Date(ts * 1000)),
-                            externalLastUpdate = externalTs?.let { sdf.format(Date(it * 1000)) },
+                            lastUpdate = metricTimestamp?.let { sdf.format(Date(it * 1000)) },
+                            externalLastUpdate = externalMetricTimestamp?.let {
+                                sdf.format(Date(it * 1000))
+                            },
                         )
                     )
                 }
@@ -878,8 +840,7 @@ private data class WeatherSnapshot(
     val hum: String,
     val externalTemp: String?,
     val externalHum: String?,
-    val externalSensorOk: Boolean,
-    val lastUpdate: String,
+    val lastUpdate: String?,
     val externalLastUpdate: String?,
 )
 
