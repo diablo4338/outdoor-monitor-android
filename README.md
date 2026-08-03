@@ -4,9 +4,8 @@ Android client for the Outdoor Monitor weather monitoring system. The applicatio
 connects to the Outdoor Monitor API and displays the latest temperature and
 humidity readings collected from outdoor sensors.
 
-The API is provided by the
-[Outdoor Monitor Backend](https://github.com/diablo4338/outdoor-monitor-backend).
-The backend reads sensor metrics from Prometheus, stores periodic snapshots, and
+The API is provided by a separate backend repository. The backend reads sensor
+metrics from Prometheus, stores periodic snapshots, and
 serves them through an authenticated HTTP API.
 
 ## Configuration
@@ -43,6 +42,7 @@ Build the release application:
 
 The GitHub Actions workflow uses a self-hosted Linux runner. Every `master` build uses
 `1000 + github.run_number` as Android `versionCode`; an `app-v1.2.0` tag or manual input sets
-the visible `versionName`. The runner reads signing material from
-`/home/dev/weather_build/signing` and atomically publishes releases under
-`/home/dev/weather_build/releases`.
+the visible `versionName`. The runner reads its API URL, publication root, and Google
+client ID from the `RELEASE_API_BASE_URL`, `RELEASE_ROOT`, and `GOOGLE_WEB_CLIENT_ID`
+repository variables. Signing material stays under `$RELEASE_ROOT/signing`, and
+releases are atomically published under `$RELEASE_ROOT/releases`.
