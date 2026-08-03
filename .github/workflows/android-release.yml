@@ -23,7 +23,8 @@ jobs:
     runs-on: [self-hosted, linux, x64]
     env:
       RELEASE_API_BASE_URL: ${{ vars.RELEASE_API_BASE_URL }}
-      RELEASE_ROOT: ${{ vars.RELEASE_ROOT }}
+      RELEASES_DIR: ${{ vars.RELEASES_DIR }}
+      SIGNING_DIR: ${{ vars.SIGNING_DIR }}
       GOOGLE_WEB_CLIENT_ID: ${{ vars.GOOGLE_WEB_CLIENT_ID }}
 
     steps:
@@ -33,7 +34,8 @@ jobs:
         shell: bash
         run: |
           : "${RELEASE_API_BASE_URL:?Set the RELEASE_API_BASE_URL repository variable}"
-          : "${RELEASE_ROOT:?Set the RELEASE_ROOT repository variable}"
+          : "${RELEASES_DIR:?Set the RELEASES_DIR repository variable}"
+          : "${SIGNING_DIR:?Set the SIGNING_DIR repository variable}"
           : "${GOOGLE_WEB_CLIENT_ID:?Set the GOOGLE_WEB_CLIENT_ID repository variable}"
           if [[ -n "${{ inputs.version_code }}" ]]; then
             version_code="${{ inputs.version_code }}"
@@ -59,7 +61,7 @@ jobs:
         shell: bash
         run: |
           set -a
-          source "$RELEASE_ROOT/signing/release.env"
+          source "$SIGNING_DIR/release.env"
           set +a
           docker buildx build \
             --file docker/Dockerfile.apk \
@@ -72,7 +74,7 @@ jobs:
             --build-arg POLL_INTERVAL_SECONDS=10 \
             --build-arg GIT_COMMIT="$GITHUB_SHA" \
             --build-arg PUBLISHED_AT="$PUBLISHED_AT" \
-            --secret id=release_keystore,src="$RELEASE_ROOT/signing/release.jks" \
+            --secret id=release_keystore,src="$SIGNING_DIR/release.jks" \
             --secret id=signing_store_password,env=SIGNING_STORE_PASSWORD \
             --secret id=signing_key_password,env=SIGNING_KEY_PASSWORD \
             .
@@ -86,18 +88,17 @@ jobs:
       - name: Publish release atomically
         shell: bash
         run: |
-          target="$RELEASE_ROOT"
-          staging="$target/.incoming-$VERSION_CODE"
-          if [[ -f "$target/releases/latest.json" ]]; then
-            current_version_code="$(awk -F: '/"version_code"/ {gsub(/[^0-9]/, "", $2); print $2}' "$target/releases/latest.json")"
+          staging="$RELEASES_DIR/.incoming-$VERSION_CODE"
+          if [[ -f "$RELEASES_DIR/latest.json" ]]; then
+            current_version_code="$(awk -F: '/"version_code"/ {gsub(/[^0-9]/, "", $2); print $2}' "$RELEASES_DIR/latest.json")"
             test "$VERSION_CODE" -gt "$current_version_code"
           fi
-          test ! -e "$target/releases/$VERSION_CODE"
-          install -d -m 755 "$staging" "$target/releases"
+          test ! -e "$RELEASES_DIR/$VERSION_CODE"
+          install -d -m 755 "$staging" "$RELEASES_DIR"
           cp -a "build/apk/releases/$VERSION_CODE" "$staging/"
           cp "build/apk/releases/latest.json" "$staging/latest.json"
           chmod 755 "$staging/$VERSION_CODE"
           chmod 644 "$staging/$VERSION_CODE"/* "$staging/latest.json"
-          mv "$staging/$VERSION_CODE" "$target/releases/$VERSION_CODE"
-          mv "$staging/latest.json" "$target/releases/latest.json"
+          mv "$staging/$VERSION_CODE" "$RELEASES_DIR/$VERSION_CODE"
+          mv "$staging/latest.json" "$RELEASES_DIR/latest.json"
           rmdir "$staging"

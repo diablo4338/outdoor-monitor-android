@@ -43,6 +43,7 @@ Build the release application:
 The GitHub Actions workflow uses a self-hosted Linux runner. Every `master` build uses
 `1000 + github.run_number` as Android `versionCode`; an `app-v1.2.0` tag or manual input sets
 the visible `versionName`. The runner reads its API URL, publication root, and Google
-client ID from the `RELEASE_API_BASE_URL`, `RELEASE_ROOT`, and `GOOGLE_WEB_CLIENT_ID`
-repository variables. Signing material stays under `$RELEASE_ROOT/signing`, and
-releases are atomically published under `$RELEASE_ROOT/releases`.
+client ID from the `RELEASE_API_BASE_URL`, `RELEASES_DIR`, `SIGNING_DIR`, and
+`GOOGLE_WEB_CLIENT_ID` repository variables. On a single build/application host, use
+`/srv/outdoor-monitor/releases` for published artifacts and keep signing material
+separately in `/var/lib/outdoor-monitor-builder/signing`.
