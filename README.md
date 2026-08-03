@@ -40,9 +40,13 @@ Build the release application:
 `manifest.json`, and `latest.json`. Version values are supplied as `VERSION_NAME` and
 `VERSION_CODE`; signing material is passed only as BuildKit secrets.
 
-The GitHub Actions workflow uses a self-hosted Linux runner. Every `master` build uses
-`1000 + github.run_number` as Android `versionCode`; an `app-v1.2.0` tag or manual input sets
-the visible `versionName`. The runner reads its API URL, publication root, and Google
+  The GitHub Actions workflow uses a self-hosted Linux runner. A release tag such as
+  `app-v1.2.0` defines the visible version base. The tagged commit is `1.2.0`; following
+  commits become `1.2.1`, `1.2.2`, and so on. Android `versionCode` is always generated as
+  `1000 + github.run_number` and cannot be entered manually. Create a checked tag with
+  `bash scripts/create-release-tag.sh 1.2.0`, then push the command printed by the script.
+  The workflow rejects tag, visible-version, and versionCode downgrades before building.
+  The runner reads its API URL, publication root, and Google
 client ID from the `RELEASE_API_BASE_URL`, `RELEASES_DIR`, `SIGNING_DIR`, and
 `GOOGLE_WEB_CLIENT_ID` repository variables. On a single build/application host, use
 `/srv/outdoor-monitor/releases` for published artifacts and keep signing material

@@ -7,30 +7,39 @@ COPY . ./
 ARG VERSION_NAME
 ARG VERSION_CODE
 ARG RELEASE_API_BASE_URL
-ARG GOOGLE_WEB_CLIENT_ID
 ARG POLL_INTERVAL_SECONDS=10
 ARG GIT_COMMIT
 ARG PUBLISHED_AT
+ARG BUILD_VARIANT=release
 
 RUN --mount=type=secret,id=release_keystore \
     --mount=type=secret,id=signing_store_password \
     --mount=type=secret,id=signing_key_password \
+    --mount=type=secret,id=google_web_client_id \
+    --mount=type=cache,id=outdoor-monitor-android-signing,target=/root/.android \
     --mount=type=cache,target=/root/.gradle \
     set -eu; \
     case "$VERSION_NAME" in *[!0-9A-Za-z.+-]*) exit 2;; esac; \
     case "$VERSION_CODE" in ''|*[!0-9]*) exit 2;; esac; \
     test -n "$RELEASE_API_BASE_URL"; \
+    GOOGLE_WEB_CLIENT_ID="$(cat /run/secrets/google_web_client_id)"; \
     test -n "$GOOGLE_WEB_CLIENT_ID"; \
     export VERSION_NAME VERSION_CODE RELEASE_API_BASE_URL GOOGLE_WEB_CLIENT_ID POLL_INTERVAL_SECONDS; \
     export DEBUG_API_BASE_URL="$RELEASE_API_BASE_URL"; \
-    export SIGNING_STORE_FILE=/run/secrets/release_keystore; \
-    export SIGNING_STORE_PASSWORD="$(cat /run/secrets/signing_store_password)"; \
-    export SIGNING_KEY_ALIAS=release; \
-    export SIGNING_KEY_PASSWORD="$(cat /run/secrets/signing_key_password)"; \
     sed -i 's/\r$//' gradlew; \
     chmod +x gradlew; \
-    ./gradlew --no-daemon :app:assembleRelease; \
-    apk_source="$(find app/build/outputs/apk/release -name '*.apk' -type f | head -n 1)"; \
+    if [ "$BUILD_VARIANT" = release ]; then \
+      export SIGNING_STORE_FILE=/run/secrets/release_keystore; \
+      export SIGNING_STORE_PASSWORD="$(cat /run/secrets/signing_store_password)"; \
+      export SIGNING_KEY_ALIAS=release; \
+      export SIGNING_KEY_PASSWORD="$(cat /run/secrets/signing_key_password)"; \
+      ./gradlew --no-daemon :app:assembleRelease; \
+    elif [ "$BUILD_VARIANT" = debug ]; then \
+      ./gradlew --no-daemon :app:assembleDebug; \
+    else \
+      echo "Unsupported BUILD_VARIANT: $BUILD_VARIANT" >&2; exit 2; \
+    fi; \
+    apk_source="$(find "app/build/outputs/apk/$BUILD_VARIANT" -name '*.apk' -type f | head -n 1)"; \
     test -n "$apk_source"; \
     release_dir="/output/releases/$VERSION_CODE"; \
     filename="outdoor-monitor-$VERSION_NAME-$VERSION_CODE.apk"; \

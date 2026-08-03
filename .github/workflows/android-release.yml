@@ -2,18 +2,13 @@ name: Android release
 
 on:
   push:
-    branches: [master]
+    branches: ['**']
     tags: ['app-v*']
   workflow_dispatch:
-    inputs:
-      version:
-        description: Explicit version name, for example 1.1.0
-        required: false
-        type: string
-      version_code:
-        description: Optional Android versionCode override
-        required: false
-        type: number
+
+concurrency:
+  group: android-release-publish
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -30,6 +25,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
 
       - name: Resolve version
         shell: bash
@@ -38,21 +35,47 @@ jobs:
           : "${RELEASES_DIR:?Set the RELEASES_DIR repository variable}"
           : "${SIGNING_DIR:?Set the SIGNING_DIR repository variable}"
           : "${GOOGLE_WEB_CLIENT_ID:?Set the GOOGLE_WEB_CLIENT_ID secret in the dev environment}"
-          if [[ -n "${{ inputs.version_code }}" ]]; then
-            version_code="${{ inputs.version_code }}"
-          else
-            version_code=$((1000 + GITHUB_RUN_NUMBER))
-          fi
-          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
-            version="${GITHUB_REF_NAME#app-v}"
-          elif [[ -n "${{ inputs.version }}" ]]; then
-            version="${{ inputs.version }}"
-          else
-            version="1.0.${GITHUB_RUN_NUMBER}"
-          fi
-          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.+-][0-9A-Za-z.-]+)?$ ]]; then
-            echo "Invalid version: $version" >&2
+          version_code=$((1000 + GITHUB_RUN_NUMBER))
+          version_tag="$(git describe --tags --match 'app-v[0-9]*.[0-9]*.[0-9]*' --abbrev=0 HEAD 2>/dev/null || true)"
+          if [[ -z "$version_tag" ]]; then
+            echo "No reachable release tag. Create one, for example: git tag app-v1.0.0 && git push origin app-v1.0.0" >&2
             exit 1
+          fi
+          base_version="${version_tag#app-v}"
+          if [[ ! "$base_version" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+            echo "Invalid release tag: $version_tag; expected app-vMAJOR.MINOR.PATCH" >&2
+            exit 1
+          fi
+          distance="$(git rev-list --count "$version_tag"..HEAD)"
+          version="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.$((BASH_REMATCH[3] + distance))"
+
+          version_gt() {
+            [[ "$1" != "$2" ]] && [[ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | tail -n1)" == "$1" ]]
+          }
+
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            if [[ "$GITHUB_REF_NAME" != "$version_tag" ]]; then
+              echo "The pushed tag is not the version base resolved for this commit" >&2
+              exit 1
+            fi
+            previous_tag="$(git tag --list 'app-v*' --merged HEAD --sort=-version:refname | grep -Fxv "$version_tag" | head -n1 || true)"
+            if [[ -n "$previous_tag" ]] && ! version_gt "$base_version" "${previous_tag#app-v}"; then
+              echo "Tag downgrade rejected: $base_version is not newer than ${previous_tag#app-v}" >&2
+              exit 1
+            fi
+          fi
+
+          if [[ -f "$RELEASES_DIR/latest.json" ]]; then
+            current_version="$(awk -F'"' '/"version_name"/ {print $4; exit}' "$RELEASES_DIR/latest.json")"
+            current_version_code="$(awk -F: '/"version_code"/ {gsub(/[^0-9]/, "", $2); print $2; exit}' "$RELEASES_DIR/latest.json")"
+            if ! version_gt "$version" "$current_version"; then
+              echo "Version downgrade/rebuild rejected: $version is not newer than published $current_version" >&2
+              exit 1
+            fi
+            if [[ "$version_code" -le "$current_version_code" ]]; then
+              echo "versionCode downgrade rejected: $version_code <= $current_version_code" >&2
+              exit 1
+            fi
           fi
           echo "VERSION_CODE=$version_code" >> "$GITHUB_ENV"
           echo "VERSION_NAME=$version" >> "$GITHUB_ENV"
@@ -71,11 +94,11 @@ jobs:
             --build-arg VERSION_NAME="$VERSION_NAME" \
             --build-arg VERSION_CODE="$VERSION_CODE" \
             --build-arg RELEASE_API_BASE_URL="$RELEASE_API_BASE_URL" \
-            --build-arg GOOGLE_WEB_CLIENT_ID="$GOOGLE_WEB_CLIENT_ID" \
             --build-arg POLL_INTERVAL_SECONDS=10 \
             --build-arg GIT_COMMIT="$GITHUB_SHA" \
             --build-arg PUBLISHED_AT="$PUBLISHED_AT" \
             --secret id=release_keystore,src="$SIGNING_DIR/release.jks" \
+            --secret id=google_web_client_id,env=GOOGLE_WEB_CLIENT_ID \
             --secret id=signing_store_password,env=SIGNING_STORE_PASSWORD \
             --secret id=signing_key_password,env=SIGNING_KEY_PASSWORD \
             .

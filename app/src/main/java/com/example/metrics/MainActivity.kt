@@ -4,6 +4,7 @@ package com.example.metrics
 
 import android.content.Context
 import android.content.Intent
+import android.net.Uri
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.os.Bundle
@@ -26,7 +27,13 @@ import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Scaffold
+import androidx.compose.material3.SnackbarHost
+import androidx.compose.material3.SnackbarHostState
+import androidx.compose.material3.SnackbarResult
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TextFieldDefaults
@@ -92,6 +99,7 @@ private const val AUTH_PROVIDER_KEY = "auth_provider"
 private const val AUTH_PROVIDER_GOOGLE = "google"
 private const val AUTH_PROVIDER_PASSWORD = "password"
 private const val WEATHER_PATH = "/api/v1/weather/latest"
+private const val APP_LATEST_PATH = "/api/v1/app/latest"
 private const val GOOGLE_AUTH_PATH = "/auth/google"
 private const val PASSWORD_AUTH_PATH = "/auth/password"
 private const val LOGOUT_PATH = "/auth/logout"
@@ -104,6 +112,38 @@ private val httpClient = OkHttpClient.Builder()
     .build()
 
 private fun apiUrl(path: String): String = BuildConfig.API_BASE_URL.trimEnd('/') + path
+
+private suspend fun loadLatestRelease(): AppRelease? = withContext(Dispatchers.IO) {
+    try {
+        val request = Request.Builder()
+            .url(apiUrl(APP_LATEST_PATH))
+            .get()
+            .build()
+        httpClient.newCall(request).execute().use { response ->
+            if (!response.isSuccessful) return@withContext null
+            val body = response.body?.string() ?: return@withContext null
+            val json = JSONObject(body)
+            AppRelease(
+                versionName = json.getString("version_name"),
+                versionCode = json.getInt("version_code"),
+                downloadUrl = json.getString("download_url"),
+            )
+        }
+    } catch (_: IOException) {
+        null
+    } catch (_: JSONException) {
+        null
+    } catch (_: IllegalArgumentException) {
+        null
+    }
+}
+
+private fun openDownload(context: Context, downloadUrl: String) {
+    val intent = Intent(Intent.ACTION_VIEW, Uri.parse(downloadUrl)).apply {
+        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+    }
+    runCatching { context.startActivity(intent) }
+}
 
 private fun getStoredJwt(context: Context): String? {
     return context
@@ -145,6 +185,10 @@ fun MetricsApp() {
 
     var jwt by remember(context) { mutableStateOf(getStoredJwt(context)) }
     var weatherState by remember { mutableStateOf(WeatherState()) }
+    var latestRelease by remember { mutableStateOf<AppRelease?>(null) }
+    var showVersionDialog by remember { mutableStateOf(false) }
+    val snackbarHostState = remember { SnackbarHostState() }
+    val availableUpdate = latestRelease?.takeIf { it.versionCode > BuildConfig.VERSION_CODE }
 
     suspend fun load(jwtForRequest: String? = jwt, allowGoogleRefresh: Boolean = true) {
         if (jwtForRequest.isNullOrBlank()) {
@@ -191,6 +235,31 @@ fun MetricsApp() {
         }
     }
 
+    LaunchedEffect(Unit) {
+        latestRelease = loadLatestRelease()
+    }
+
+    LaunchedEffect(availableUpdate?.versionCode) {
+        val release = availableUpdate ?: return@LaunchedEffect
+        val result = snackbarHostState.showSnackbar(
+            message = "Доступна новая версия ${release.versionName}",
+            actionLabel = "Скачать",
+            withDismissAction = true,
+        )
+        if (result == SnackbarResult.ActionPerformed) {
+            openDownload(context, release.downloadUrl)
+        }
+    }
+
+    Scaffold(
+        containerColor = Color.Black,
+        snackbarHost = { SnackbarHost(snackbarHostState) },
+    ) { contentPadding ->
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(contentPadding),
+        ) {
     if (jwt.isNullOrBlank()) {
         LoginScreen(
             onPasswordLogin = { username, password ->
@@ -258,6 +327,70 @@ fun MetricsApp() {
             },
         )
     }
+
+            IconButton(
+                onClick = { showVersionDialog = true },
+                modifier = Modifier
+                    .align(Alignment.TopEnd)
+                    .padding(12.dp),
+            ) {
+                Text(
+                    text = "ⓘ",
+                    color = Color(0xFFAAAAAA),
+                    fontSize = 28.sp,
+                )
+            }
+
+            if (showVersionDialog) {
+                VersionDialog(
+                    latestRelease = latestRelease,
+                    updateAvailable = availableUpdate != null,
+                    onDownload = availableUpdate?.let { release ->
+                        { openDownload(context, release.downloadUrl) }
+                    },
+                    onDismiss = { showVersionDialog = false },
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun VersionDialog(
+    latestRelease: AppRelease?,
+    updateAvailable: Boolean,
+    onDownload: (() -> Unit)?,
+    onDismiss: () -> Unit,
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("О приложении") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text("Текущая версия: ${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE})")
+                Text(
+                    latestRelease?.let {
+                        "Последняя версия: ${it.versionName} (${it.versionCode})"
+                    } ?: "Последняя версия: не удалось получить",
+                )
+                if (latestRelease != null && !updateAvailable) {
+                    Text("Установлена актуальная версия")
+                }
+            }
+        },
+        confirmButton = {
+            if (onDownload != null) {
+                TextButton(onClick = onDownload) { Text("Скачать") }
+            } else {
+                TextButton(onClick = onDismiss) { Text("Закрыть") }
+            }
+        },
+        dismissButton = if (onDownload != null) {
+            { TextButton(onClick = onDismiss) { Text("Закрыть") } }
+        } else {
+            null
+        },
+    )
 }
 
 @Composable
@@ -823,6 +956,12 @@ private data class WeatherState(
     val snapshot: WeatherSnapshot? = null,
     val error: String? = null,
     val loading: Boolean = false,
+)
+
+private data class AppRelease(
+    val versionName: String,
+    val versionCode: Int,
+    val downloadUrl: String,
 )
 
 private data class WeatherSnapshot(
