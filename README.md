@@ -30,14 +30,15 @@ Build with Gradle from the `client` directory:
 Run this from the parent project root:
 
 ```bash
-make apk-local-build \
-  APK_LOCAL_VERSION_NAME=1.2.7-debug \
-  APK_LOCAL_VERSION_CODE=12007
+make apk-build \
+  APK_VERSION_NAME=1.2.7-debug \
+  APK_VERSION_CODE=12007
 ```
 
 Additional variables:
 
-- `APK_LOCAL_API_BASE_URL` — API URL embedded in the APK;
+- `API_PORT` — API port from `docker/.env`, used by both Compose and the APK;
+- `APK_API_HOST` — API host embedded in the APK (`10.0.2.2` for an emulator);
 - `APK_GOOGLE_CLIENT_ID` — Google web client ID, stored only in `docker/.env`;
 - `APK_POLL_INTERVAL_SECONDS` — weather polling interval.
 
@@ -54,22 +55,22 @@ build/releases/latest.json
 ```
 
 The local API sees these files immediately through its Compose volume. For an emulator
-and `API_PORT=8002`, use:
+and `API_PORT=8002`, no second port setting is needed. For a physical device, use:
 
 ```dotenv
-APK_LOCAL_API_BASE_URL=http://10.0.2.2:8002
+make apk-build APK_API_HOST=192.168.1.100
 ```
 
 To test the update flow, first build and install an older version:
 
 ```bash
-make apk-local-build APK_LOCAL_VERSION_NAME=1.2.6-debug APK_LOCAL_VERSION_CODE=12006
+make apk-build APK_VERSION_NAME=1.2.6-debug APK_VERSION_CODE=12006
 ```
 
 Then publish a newer version without installing it manually:
 
 ```bash
-make apk-local-build APK_LOCAL_VERSION_NAME=1.2.7-debug APK_LOCAL_VERSION_CODE=12007
+make apk-build APK_VERSION_NAME=1.2.7-debug APK_VERSION_CODE=12007
 ```
 
 On startup, the installed client requests `/api/v1/app/latest`, detects the greater
