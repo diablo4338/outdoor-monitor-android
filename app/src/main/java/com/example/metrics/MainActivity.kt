@@ -178,12 +178,6 @@ fun MetricsApp() {
                     error = result.message,
                 )
             }
-            WeatherResult.SensorError -> {
-                weatherState = WeatherState(
-                    snapshot = weatherState.snapshot,
-                    error = "Сенсор не отвечает - показания не обновлены",
-                )
-            }
         }
     }
 
@@ -319,16 +313,16 @@ private fun WeatherScreen(
                 .heightIn(min = 52.dp),
             contentAlignment = Alignment.Center,
         ) {
-            val errorText = state.error
-                ?: if (
-                    pagerState.currentPage == 1
-                    && snapshot != null
-                    && (snapshot.externalTemp == null || snapshot.externalHum == null)
-                ) {
+            val errorText = state.error ?: when {
+                snapshot == null -> null
+                pagerState.currentPage == 0 &&
+                    (snapshot.temp == null || snapshot.hum == null) ->
+                    "Сенсор не отвечает - показания не обновлены"
+                pagerState.currentPage == 1 &&
+                    (snapshot.externalTemp == null || snapshot.externalHum == null) ->
                     "Дополнительный датчик не отвечает"
-                } else {
-                    null
-                }
+                else -> null
+            }
 
             if (errorText != null) {
                 ErrorText(errorText)
@@ -580,23 +574,19 @@ private suspend fun loadWeather(context: Context, jwt: String?): WeatherResult {
                 } else {
                     json.getLong("external_metric_timestamp")
                 }
-                if (temp == null || hum == null) {
-                    WeatherResult.SensorError
-                } else {
-                    val sdf = SimpleDateFormat("dd.MM.yyyy HH:mm:ss", Locale.getDefault())
-                    WeatherResult.Success(
-                        WeatherSnapshot(
-                            temp = temp,
-                            hum = hum,
-                            externalTemp = externalTemp,
-                            externalHum = externalHum,
-                            lastUpdate = metricTimestamp?.let { sdf.format(Date(it * 1000)) },
-                            externalLastUpdate = externalMetricTimestamp?.let {
-                                sdf.format(Date(it * 1000))
-                            },
-                        )
+                val sdf = SimpleDateFormat("dd.MM.yyyy HH:mm:ss", Locale.getDefault())
+                WeatherResult.Success(
+                    WeatherSnapshot(
+                        temp = temp,
+                        hum = hum,
+                        externalTemp = externalTemp,
+                        externalHum = externalHum,
+                        lastUpdate = metricTimestamp?.let { sdf.format(Date(it * 1000)) },
+                        externalLastUpdate = externalMetricTimestamp?.let {
+                            sdf.format(Date(it * 1000))
+                        },
                     )
-                }
+                )
             } catch (_: JSONException) {
                 WeatherResult.Failure("Backend вернул некорректные данные")
             }
@@ -836,8 +826,8 @@ private data class WeatherState(
 )
 
 private data class WeatherSnapshot(
-    val temp: String,
-    val hum: String,
+    val temp: String?,
+    val hum: String?,
     val externalTemp: String?,
     val externalHum: String?,
     val lastUpdate: String?,
@@ -848,7 +838,6 @@ private sealed interface WeatherResult {
     data class Success(val snapshot: WeatherSnapshot) : WeatherResult
     data object Unauthorized : WeatherResult
     data class Failure(val message: String) : WeatherResult
-    data object SensorError : WeatherResult
 }
 
 private sealed interface FetchResponse {
