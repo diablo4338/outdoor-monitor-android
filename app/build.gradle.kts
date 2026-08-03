@@ -45,8 +45,8 @@ android {
         applicationId = "com.example.metrics"
         minSdk = 26
         targetSdk = 34
-        versionCode = 1
-        versionName = "1.1"
+        versionCode = envValue("VERSION_CODE")?.toIntOrNull() ?: 1
+        versionName = envValue("VERSION_NAME") ?: "1.1-dev"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
@@ -72,6 +72,21 @@ android {
         }
 
         release {
+            val signingStoreFile = envValue("SIGNING_STORE_FILE")
+            val signingStorePassword = envValue("SIGNING_STORE_PASSWORD")
+            val signingKeyAlias = envValue("SIGNING_KEY_ALIAS")
+            val signingKeyPassword = envValue("SIGNING_KEY_PASSWORD")
+            if (
+                signingStoreFile != null && signingStorePassword != null &&
+                signingKeyAlias != null && signingKeyPassword != null
+            ) {
+                signingConfig = signingConfigs.create("release") {
+                    storeFile = file(signingStoreFile)
+                    storePassword = signingStorePassword
+                    keyAlias = signingKeyAlias
+                    keyPassword = signingKeyPassword
+                }
+            }
             buildConfigField(
                 "String",
                 "API_BASE_URL",

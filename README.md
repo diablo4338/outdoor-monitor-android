@@ -34,3 +34,15 @@ Build the release application:
 ```bash
 ./gradlew assembleRelease
 ```
+
+## Docker releases
+
+`docker/Dockerfile.apk` builds and signs the application and exports a versioned APK,
+`manifest.json`, and `latest.json`. Version values are supplied as `VERSION_NAME` and
+`VERSION_CODE`; signing material is passed only as BuildKit secrets.
+
+The GitHub Actions workflow uses a self-hosted Linux runner. Every `master` build uses
+`1000 + github.run_number` as Android `versionCode`; an `app-v1.2.0` tag or manual input sets
+the visible `versionName`. The runner reads signing material from
+`/home/dev/weather_build/signing` and atomically publishes releases under
+`/home/dev/weather_build/releases`.
