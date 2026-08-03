@@ -21,6 +21,7 @@ permissions:
 jobs:
   build-and-publish:
     runs-on: [self-hosted, linux, x64]
+    environment: dev
     env:
       RELEASE_API_BASE_URL: ${{ vars.RELEASE_API_BASE_URL }}
       RELEASES_DIR: ${{ vars.RELEASES_DIR }}

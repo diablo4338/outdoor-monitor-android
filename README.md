@@ -48,7 +48,8 @@ client ID from the `RELEASE_API_BASE_URL`, `RELEASES_DIR`, `SIGNING_DIR`, and
 `/srv/outdoor-monitor/releases` for published artifacts and keep signing material
 separately in `/var/lib/outdoor-monitor-builder/signing`.
 
-Configure these under GitHub repository **Settings → Secrets and variables → Actions → Variables**:
+The workflow uses the GitHub environment named `dev`. Configure these under
+**Settings → Environments → dev → Environment variables**:
 
 - `RELEASE_API_BASE_URL` — public backend base URL.
 - `RELEASES_DIR` — `/srv/outdoor-monitor/releases` on the self-hosted runner.
