@@ -47,3 +47,22 @@ client ID from the `RELEASE_API_BASE_URL`, `RELEASES_DIR`, `SIGNING_DIR`, and
 `GOOGLE_WEB_CLIENT_ID` repository variables. On a single build/application host, use
 `/srv/outdoor-monitor/releases` for published artifacts and keep signing material
 separately in `/var/lib/outdoor-monitor-builder/signing`.
+
+Configure these under GitHub repository **Settings → Secrets and variables → Actions → Variables**:
+
+- `RELEASE_API_BASE_URL` — public backend base URL.
+- `RELEASES_DIR` — `/srv/outdoor-monitor/releases` on the self-hosted runner.
+- `SIGNING_DIR` — `/var/lib/outdoor-monitor-builder/signing` on the runner.
+- `GOOGLE_WEB_CLIENT_ID` — Android application's Google web client ID.
+
+Signing passwords are intentionally not stored in GitHub or Compose. Create
+`$SIGNING_DIR/release.env` directly on the runner with mode `600`:
+
+```text
+SIGNING_STORE_PASSWORD=<value>
+SIGNING_KEY_PASSWORD=<value>
+SIGNING_KEY_ALIAS=release
+```
+
+Store the keystore as `$SIGNING_DIR/release.jks`, also with mode `600`. The runner
+service account must be able to read both files and write to `RELEASES_DIR`.

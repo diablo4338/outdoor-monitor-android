@@ -28,7 +28,7 @@ jobs:
       GOOGLE_WEB_CLIENT_ID: ${{ vars.GOOGLE_WEB_CLIENT_ID }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Resolve version
         shell: bash
@@ -79,7 +79,7 @@ jobs:
             --secret id=signing_key_password,env=SIGNING_KEY_PASSWORD \
             .
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: outdoor-monitor-${{ env.VERSION_NAME }}-${{ env.VERSION_CODE }}
           path: build/apk/releases
