@@ -54,7 +54,9 @@ The workflow uses the GitHub environment named `dev`. Configure these under
 - `RELEASE_API_BASE_URL` — public backend base URL.
 - `RELEASES_DIR` — `/srv/outdoor-monitor/releases` on the self-hosted runner.
 - `SIGNING_DIR` — `/var/lib/outdoor-monitor-builder/signing` on the runner.
-- `GOOGLE_WEB_CLIENT_ID` — Android application's Google web client ID.
+
+Configure `GOOGLE_WEB_CLIENT_ID` separately under
+**Settings → Environments → dev → Environment secrets**.
 
 Signing passwords are intentionally not stored in GitHub or Compose. Create
 `$SIGNING_DIR/release.env` directly on the runner with mode `600`:

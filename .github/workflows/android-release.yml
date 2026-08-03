@@ -26,7 +26,7 @@ jobs:
       RELEASE_API_BASE_URL: ${{ vars.RELEASE_API_BASE_URL }}
       RELEASES_DIR: ${{ vars.RELEASES_DIR }}
       SIGNING_DIR: ${{ vars.SIGNING_DIR }}
-      GOOGLE_WEB_CLIENT_ID: ${{ vars.GOOGLE_WEB_CLIENT_ID }}
+      GOOGLE_WEB_CLIENT_ID: ${{ secrets.GOOGLE_WEB_CLIENT_ID }}
 
     steps:
       - uses: actions/checkout@v6
@@ -37,7 +37,7 @@ jobs:
           : "${RELEASE_API_BASE_URL:?Set the RELEASE_API_BASE_URL repository variable}"
           : "${RELEASES_DIR:?Set the RELEASES_DIR repository variable}"
           : "${SIGNING_DIR:?Set the SIGNING_DIR repository variable}"
-          : "${GOOGLE_WEB_CLIENT_ID:?Set the GOOGLE_WEB_CLIENT_ID repository variable}"
+          : "${GOOGLE_WEB_CLIENT_ID:?Set the GOOGLE_WEB_CLIENT_ID secret in the dev environment}"
           if [[ -n "${{ inputs.version_code }}" ]]; then
             version_code="${{ inputs.version_code }}"
           else
