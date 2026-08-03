@@ -83,15 +83,16 @@ Versions are not entered manually in GitHub Actions. A
 
 ```text
 app-v1.2.0  -> tagged commit: 1.2.0
-next commit -> 1.2.1
-next commit -> 1.2.2
+next successful build -> 1.2.1
+next successful build -> 1.2.2
 app-v2.0.0  -> tagged commit: 2.0.0
 ```
 
-The patch component after the tag is derived from the number of commits. Android
-`versionCode` is generated separately as `1000 + github.run_number` and must always
-increase. The client uses `versionCode`, rather than the visible version, to decide
-whether an update is available.
+Each successful publication increments the patch component from the version stored in
+`RELEASES_DIR/latest.json`, including a rerun on the same commit. A newer tag replaces
+the base explicitly. Android `versionCode` is generated separately as
+`1000 + github.run_number` and must always increase. The client uses `versionCode`,
+rather than the visible version, to decide whether an update is available.
 
 ## Creating a release tag
 
@@ -107,9 +108,9 @@ The script fetches current tags, validates the format, rejects duplicate or lowe
 versions, and creates an annotated tag. Even when a tag is created manually, the
 workflow repeats the checks on the runner and rejects a downgrade before building.
 
-After the first tag, ordinary pushes automatically increase the patch component. A
-new tag is needed only to change the version base, for example from `1.2.x` to `1.3.0`
-or `2.0.0`.
+After the first tag, every successful ordinary or manually restarted workflow run
+automatically increases the patch component. A new tag is needed only to change the
+version base, for example from `1.2.x` to `1.3.0` or `2.0.0`.
 
 ## GitHub Actions configuration
 
@@ -144,16 +145,18 @@ passwords are also passed only as secrets and are not stored in image history.
 ## Production release publishing process
 
 1. `checkout` fetches the complete history and all tags.
-2. The workflow finds the latest reachable `app-v*` tag and calculates `versionName`.
-3. It generates a monotonic `versionCode` from the workflow run number.
-4. Both values are compared with `$RELEASES_DIR/latest.json`; equal or lower versions
+2. The workflow finds the latest reachable `app-v*` tag and reads the currently
+   published version from `latest.json`.
+3. It uses a newer tag as the new base or increments the published patch by one.
+4. It generates a monotonic `versionCode` from the workflow run number.
+5. Both values are compared with `$RELEASES_DIR/latest.json`; lower version bases
    are rejected.
-5. Docker builds and signs the release APK.
-6. The build creates the APK, `manifest.json`, and `latest.json`, including SHA-256,
+6. Docker builds and signs the release APK.
+7. The build creates the APK, `manifest.json`, and `latest.json`, including SHA-256,
    file size, publication time, and commit SHA.
-7. The result is stored as a GitHub Actions artifact.
-8. The version directory and `latest.json` are moved atomically into `RELEASES_DIR`.
-9. The backend starts returning the new version and APK URL without a restart.
+8. The result is stored as a GitHub Actions artifact.
+9. The version directory and `latest.json` are moved atomically into `RELEASES_DIR`.
+10. The backend starts returning the new version and APK URL without a restart.
 
 Publishing jobs are serialized through a GitHub Actions concurrency group. Two runner
 jobs cannot update `latest.json` simultaneously, and an existing `versionCode`
