@@ -2,8 +2,7 @@ name: Android release
 
 on:
   push:
-    branches: ['**']
-    tags: ['app-v*']
+    branches: [master]
   workflow_dispatch:
 
 concurrency:

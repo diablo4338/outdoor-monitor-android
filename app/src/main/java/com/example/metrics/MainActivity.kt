@@ -4,7 +4,6 @@ package com.example.metrics
 
 import android.content.Context
 import android.content.Intent
-import android.net.Uri
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.os.Bundle
@@ -60,6 +59,8 @@ import com.google.android.gms.common.api.ApiException
 import com.google.android.gms.tasks.Tasks
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.repeatOnLifecycle
+import androidx.core.content.edit
+import androidx.core.net.toUri
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -83,6 +84,7 @@ import java.util.concurrent.ExecutionException
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.TimeoutException
 import javax.net.ssl.SSLException
+import kotlin.time.Duration.Companion.seconds
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -139,7 +141,7 @@ private suspend fun loadLatestRelease(): AppRelease? = withContext(Dispatchers.I
 }
 
 private fun openDownload(context: Context, downloadUrl: String) {
-    val intent = Intent(Intent.ACTION_VIEW, Uri.parse(downloadUrl)).apply {
+    val intent = Intent(Intent.ACTION_VIEW, downloadUrl.toUri()).apply {
         addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
     }
     runCatching { context.startActivity(intent) }
@@ -155,10 +157,10 @@ private fun getStoredJwt(context: Context): String? {
 private fun saveAuthSession(context: Context, jwt: String, provider: String) {
     context
         .getSharedPreferences(AUTH_PREFS, Context.MODE_PRIVATE)
-        .edit()
-        .putString(JWT_KEY, jwt)
-        .putString(AUTH_PROVIDER_KEY, provider)
-        .apply()
+        .edit {
+            putString(JWT_KEY, jwt)
+            putString(AUTH_PROVIDER_KEY, provider)
+        }
 }
 
 private fun getStoredAuthProvider(context: Context): String? {
@@ -171,10 +173,10 @@ private fun getStoredAuthProvider(context: Context): String? {
 private fun clearAuthSession(context: Context) {
     context
         .getSharedPreferences(AUTH_PREFS, Context.MODE_PRIVATE)
-        .edit()
-        .remove(JWT_KEY)
-        .remove(AUTH_PROVIDER_KEY)
-        .apply()
+        .edit {
+            remove(JWT_KEY)
+            remove(AUTH_PROVIDER_KEY)
+        }
 }
 
 @Composable
@@ -230,7 +232,7 @@ fun MetricsApp() {
         lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
             while (true) {
                 load(pollingJwt)
-                delay(BuildConfig.POLL_INTERVAL_SECONDS * 1_000L)
+                delay(BuildConfig.POLL_INTERVAL_SECONDS.seconds)
             }
         }
     }
@@ -290,17 +292,18 @@ fun MetricsApp() {
                             saveAuthSession(context, result.token, AUTH_PROVIDER_GOOGLE)
                             jwt = result.token
                         }
-                        AuthResult.InvalidCredentials,
-                        is AuthResult.Failure -> {
-                            val message = when (result) {
-                                AuthResult.InvalidCredentials -> "Google token отклонен backend"
-                                is AuthResult.Failure -> result.message
-                                is AuthResult.Success -> "Не удалось войти через Google"
-                            }
+                        AuthResult.InvalidCredentials -> {
                             signOutGoogle(context)
                             clearAuthSession(context)
                             jwt = null
-                            weatherState = WeatherState(error = message)
+                            weatherState = WeatherState(error = "Google token отклонен backend")
+                            return@launch
+                        }
+                        is AuthResult.Failure -> {
+                            signOutGoogle(context)
+                            clearAuthSession(context)
+                            jwt = null
+                            weatherState = WeatherState(error = result.message)
                             return@launch
                         }
                     }
@@ -312,7 +315,6 @@ fun MetricsApp() {
     } else {
         WeatherScreen(
             state = weatherState,
-            hasToken = jwt != null,
             onLogout = {
                 val token = jwt
                 scope.launch {
@@ -396,7 +398,6 @@ private fun VersionDialog(
 @Composable
 private fun WeatherScreen(
     state: WeatherState,
-    hasToken: Boolean,
     onLogout: () -> Unit,
 ) {
     val snapshot = state.snapshot
@@ -462,10 +463,8 @@ private fun WeatherScreen(
             }
         }
 
-        if (hasToken) {
-            TextButton(onClick = onLogout, enabled = !state.loading) {
-                Text("Выйти")
-            }
+        TextButton(onClick = onLogout, enabled = !state.loading) {
+            Text("Выйти")
         }
     }
 }
@@ -587,45 +586,47 @@ private fun LoginScreen(
 
         Spacer(modifier = Modifier.height(24.dp))
 
-        OutlinedTextField(
-            value = username,
-            onValueChange = { username = it },
-            singleLine = true,
-            label = { Text("Имя") },
-            colors = fieldColors,
-            modifier = Modifier.fillMaxWidth()
-        )
+        if (BuildConfig.DEBUG) {
+            OutlinedTextField(
+                value = username,
+                onValueChange = { username = it },
+                singleLine = true,
+                label = { Text("Имя") },
+                colors = fieldColors,
+                modifier = Modifier.fillMaxWidth()
+            )
 
-        Spacer(modifier = Modifier.height(12.dp))
+            Spacer(modifier = Modifier.height(12.dp))
 
-        OutlinedTextField(
-            value = password,
-            onValueChange = { password = it },
-            singleLine = true,
-            label = { Text("Пароль") },
-            visualTransformation = PasswordVisualTransformation(),
-            colors = fieldColors,
-            modifier = Modifier.fillMaxWidth()
-        )
+            OutlinedTextField(
+                value = password,
+                onValueChange = { password = it },
+                singleLine = true,
+                label = { Text("Пароль") },
+                visualTransformation = PasswordVisualTransformation(),
+                colors = fieldColors,
+                modifier = Modifier.fillMaxWidth()
+            )
 
-        Spacer(modifier = Modifier.height(18.dp))
+            Spacer(modifier = Modifier.height(18.dp))
 
-        Button(
-            onClick = {
-                if (loading) return@Button
-                localError = null
-                onPasswordLogin(username.trim(), password)
-            },
-            enabled = username.isNotBlank() && password.isNotBlank(),
-            colors = buttonColors,
-            modifier = Modifier
-                .fillMaxWidth()
-                .height(48.dp)
-        ) {
-            Text("Войти")
+            Button(
+                onClick = {
+                    if (loading) return@Button
+                    localError = null
+                    onPasswordLogin(username.trim(), password)
+                },
+                enabled = username.isNotBlank() && password.isNotBlank(),
+                colors = buttonColors,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(48.dp)
+            ) {
+                Text("Войти")
+            }
+
+            Spacer(modifier = Modifier.height(12.dp))
         }
-
-        Spacer(modifier = Modifier.height(12.dp))
 
         Button(
             onClick = {
