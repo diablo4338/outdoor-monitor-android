@@ -27,7 +27,7 @@ Build with Gradle from the `client` directory:
 
 ## Local debug build with an explicit version
 
-Run this from the parent project root:
+Run this from the `client` directory:
 
 ```bash
 make apk-build \
@@ -43,7 +43,7 @@ Additional variables:
 - `APK_POLL_INTERVAL_SECONDS` — weather polling interval.
 
 When `APK_GOOGLE_CLIENT_ID` is empty in `docker/.env`, the local build attempts to
-read `GOOGLE_WEB_CLIENT_ID` from `client/local.properties`. Both files are ignored by
+read `GOOGLE_WEB_CLIENT_ID` from `local.properties`. Both files are ignored by
 Git.
 
 The build publishes its output into the shared release directory:

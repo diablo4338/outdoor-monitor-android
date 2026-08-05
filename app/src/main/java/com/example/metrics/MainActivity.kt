@@ -369,12 +369,13 @@ private fun VersionDialog(
         title = { Text("О приложении") },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                Text("Текущая версия: ${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE})")
-                Text(
-                    latestRelease?.let {
-                        "Последняя версия: ${it.versionName} (${it.versionCode})"
-                    } ?: "Последняя версия: не удалось получить",
-                )
+                Text("Текущая версия: ${BuildConfig.VERSION_NAME}")
+                if (updateAvailable && latestRelease != null) {
+                    Text("Последняя: ${latestRelease.versionName}")
+                }
+                if (latestRelease == null) {
+                    Text("Не удалось получить последнюю версию")
+                }
                 if (latestRelease != null && !updateAvailable) {
                     Text("Установлена актуальная версия")
                 }
