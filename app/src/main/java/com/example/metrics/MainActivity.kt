@@ -42,6 +42,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -63,6 +64,7 @@ import androidx.core.content.edit
 import androidx.core.net.toUri
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
@@ -100,7 +102,8 @@ private const val JWT_KEY = "backend_jwt"
 private const val AUTH_PROVIDER_KEY = "auth_provider"
 private const val AUTH_PROVIDER_GOOGLE = "google"
 private const val AUTH_PROVIDER_PASSWORD = "password"
-private const val WEATHER_PATH = "/api/v1/weather/latest"
+private const val PRIMARY_WEATHER_PATH = "/api/v1/weather/primary/latest"
+private const val EXTERNAL_WEATHER_PATH = "/api/v1/weather/external/latest"
 private const val APP_LATEST_PATH = "/api/v1/app/latest"
 private const val GOOGLE_AUTH_PATH = "/auth/google"
 private const val PASSWORD_AUTH_PATH = "/auth/password"
@@ -187,30 +190,33 @@ fun MetricsApp() {
 
     var jwt by remember(context) { mutableStateOf(getStoredJwt(context)) }
     var weatherState by remember { mutableStateOf(WeatherState()) }
+    var selectedDevice by remember { mutableStateOf(SensorDevice.Primary) }
     var latestRelease by remember { mutableStateOf<AppRelease?>(null) }
     var showVersionDialog by remember { mutableStateOf(false) }
     val snackbarHostState = remember { SnackbarHostState() }
     val availableUpdate = latestRelease?.takeIf { it.versionCode > BuildConfig.VERSION_CODE }
 
-    suspend fun load(jwtForRequest: String? = jwt, allowGoogleRefresh: Boolean = true) {
+    suspend fun load(
+        device: SensorDevice,
+        jwtForRequest: String? = jwt,
+        allowGoogleRefresh: Boolean = true,
+    ) {
         if (jwtForRequest.isNullOrBlank()) {
             weatherState = WeatherState()
             return
         }
-        weatherState = weatherState.copy(
-            loading = weatherState.snapshot == null,
-        )
-        val result = loadWeather(context, jwtForRequest)
+        weatherState = weatherState.withLoading(device, true)
+        val result = loadWeather(context, jwtForRequest, device)
         when (result) {
             is WeatherResult.Success -> {
-                weatherState = WeatherState(snapshot = result.snapshot)
+                weatherState = weatherState.withSnapshot(device, result.snapshot)
             }
             WeatherResult.Unauthorized -> {
                 if (allowGoogleRefresh && getStoredAuthProvider(context) == AUTH_PROVIDER_GOOGLE) {
                     val refreshedToken = refreshGoogleBackendToken(context)
                     if (refreshedToken != null) {
                         jwt = refreshedToken
-                        load(refreshedToken, allowGoogleRefresh = false)
+                        load(device, refreshedToken, allowGoogleRefresh = false)
                         return
                     }
                 }
@@ -219,21 +225,26 @@ fun MetricsApp() {
                 weatherState = WeatherState()
             }
             is WeatherResult.Failure -> {
-                weatherState = WeatherState(
-                    snapshot = weatherState.snapshot,
-                    error = result.message,
-                )
+                weatherState = weatherState.withError(device, result.message)
             }
         }
     }
 
-    LaunchedEffect(jwt, lifecycle) {
+    LaunchedEffect(jwt, lifecycle, selectedDevice) {
         val pollingJwt = jwt?.takeIf { it.isNotBlank() } ?: return@LaunchedEffect
         lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
             while (true) {
-                load(pollingJwt)
+                load(selectedDevice, pollingJwt)
                 delay(BuildConfig.POLL_INTERVAL_SECONDS.seconds)
             }
+        }
+    }
+
+    // Warm the second page so it already has values before the first swipe.
+    LaunchedEffect(jwt, lifecycle) {
+        val preloadJwt = jwt?.takeIf { it.isNotBlank() } ?: return@LaunchedEffect
+        lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
+            load(SensorDevice.External, preloadJwt)
         }
     }
 
@@ -278,8 +289,10 @@ fun MetricsApp() {
                         }
                         is AuthResult.Success -> {
                             saveAuthSession(context, result.token, AUTH_PROVIDER_PASSWORD)
+                            weatherState = WeatherState()
+                            selectedDevice = SensorDevice.Primary
                             jwt = result.token
-                            load(result.token)
+                            load(SensorDevice.Primary, result.token)
                         }
                     }
                 }
@@ -290,6 +303,8 @@ fun MetricsApp() {
                     when (val result = loginWithGoogle(idToken)) {
                         is AuthResult.Success -> {
                             saveAuthSession(context, result.token, AUTH_PROVIDER_GOOGLE)
+                            weatherState = WeatherState()
+                            selectedDevice = SensorDevice.Primary
                             jwt = result.token
                         }
                         AuthResult.InvalidCredentials -> {
@@ -315,6 +330,7 @@ fun MetricsApp() {
     } else {
         WeatherScreen(
             state = weatherState,
+            onDeviceSelected = { selectedDevice = it },
             onLogout = {
                 val token = jwt
                 scope.launch {
@@ -325,6 +341,7 @@ fun MetricsApp() {
                     clearAuthSession(context)
                     jwt = null
                     weatherState = WeatherState()
+                    selectedDevice = SensorDevice.Primary
                 }
             },
         )
@@ -399,10 +416,19 @@ private fun VersionDialog(
 @Composable
 private fun WeatherScreen(
     state: WeatherState,
+    onDeviceSelected: (SensorDevice) -> Unit,
     onLogout: () -> Unit,
 ) {
     val snapshot = state.snapshot
     val pagerState = rememberPagerState(pageCount = { 2 })
+
+    LaunchedEffect(pagerState) {
+        snapshotFlow { pagerState.currentPage }
+            .distinctUntilChanged()
+            .collect { page ->
+                onDeviceSelected(if (page == 0) SensorDevice.Primary else SensorDevice.External)
+            }
+    }
 
     Column(
         modifier = Modifier
@@ -448,7 +474,17 @@ private fun WeatherScreen(
                 .heightIn(min = 52.dp),
             contentAlignment = Alignment.Center,
         ) {
-            val errorText = state.error ?: when {
+            val displayedDevice = if (pagerState.currentPage == 0) {
+                SensorDevice.Primary
+            } else {
+                SensorDevice.External
+            }
+            val requestError = state.errorFor(displayedDevice)
+            val errorText = when {
+                pagerState.isScrollInProgress -> null
+                state.isLoadingFor(displayedDevice) -> null
+                requestError != null -> requestError
+                !state.hasLoaded(displayedDevice) -> null
                 snapshot == null -> null
                 pagerState.currentPage == 0 &&
                     (snapshot.temp == null || snapshot.hum == null) ->
@@ -680,8 +716,12 @@ private fun ErrorText(text: String, modifier: Modifier = Modifier) {
     )
 }
 
-private suspend fun loadWeather(context: Context, jwt: String?): WeatherResult {
-    return when (val response = fetchWeatherMetrics(jwt)) {
+private suspend fun loadWeather(
+    context: Context,
+    jwt: String?,
+    device: SensorDevice,
+): WeatherResult {
+    return when (val response = fetchWeatherMetrics(jwt, device)) {
         FetchResponse.Unauthorized -> WeatherResult.Unauthorized
         is FetchResponse.Failure -> WeatherResult.Failure(response.toUserMessage(context))
         is FetchResponse.Success -> {
@@ -729,9 +769,11 @@ private suspend fun loadWeather(context: Context, jwt: String?): WeatherResult {
     }
 }
 
-private suspend fun fetchWeatherMetrics(jwt: String?): FetchResponse {
+private suspend fun fetchWeatherMetrics(jwt: String?, device: SensorDevice): FetchResponse {
     return withContext(Dispatchers.IO) {
-        val requestUrl = apiUrl(WEATHER_PATH)
+        val requestUrl = apiUrl(
+            if (device == SensorDevice.Primary) PRIMARY_WEATHER_PATH else EXTERNAL_WEATHER_PATH
+        )
         try {
             val requestBuilder = Request.Builder()
                 .url(requestUrl)
@@ -958,7 +1000,79 @@ private data class WeatherState(
     val snapshot: WeatherSnapshot? = null,
     val error: String? = null,
     val loading: Boolean = false,
-)
+    val primaryError: String? = null,
+    val externalError: String? = null,
+    val primaryLoading: Boolean = false,
+    val externalLoading: Boolean = false,
+    val primaryLoaded: Boolean = false,
+    val externalLoaded: Boolean = false,
+) {
+    fun errorFor(device: SensorDevice): String? = error ?: when (device) {
+        SensorDevice.Primary -> primaryError
+        SensorDevice.External -> externalError
+    }
+
+    fun isLoadingFor(device: SensorDevice): Boolean = when (device) {
+        SensorDevice.Primary -> primaryLoading
+        SensorDevice.External -> externalLoading
+    }
+
+    fun hasLoaded(device: SensorDevice): Boolean = when (device) {
+        SensorDevice.Primary -> primaryLoaded
+        SensorDevice.External -> externalLoaded
+    }
+
+    fun withLoading(device: SensorDevice, value: Boolean): WeatherState = when (device) {
+        SensorDevice.Primary -> copy(primaryLoading = value, primaryError = null)
+        SensorDevice.External -> copy(externalLoading = value, externalError = null)
+    }
+
+    fun withError(device: SensorDevice, message: String): WeatherState = when (device) {
+        SensorDevice.Primary -> copy(primaryLoading = false, primaryError = message)
+        SensorDevice.External -> copy(externalLoading = false, externalError = message)
+    }
+
+    fun withSnapshot(device: SensorDevice, update: WeatherSnapshot): WeatherState {
+        val current = snapshot
+        val merged = when (device) {
+            SensorDevice.Primary -> WeatherSnapshot(
+                temp = update.temp,
+                hum = update.hum,
+                externalTemp = current?.externalTemp,
+                externalHum = current?.externalHum,
+                lastUpdate = update.lastUpdate,
+                externalLastUpdate = current?.externalLastUpdate,
+            )
+            SensorDevice.External -> WeatherSnapshot(
+                temp = current?.temp,
+                hum = current?.hum,
+                externalTemp = update.externalTemp,
+                externalHum = update.externalHum,
+                lastUpdate = current?.lastUpdate,
+                externalLastUpdate = update.externalLastUpdate,
+            )
+        }
+        return when (device) {
+            SensorDevice.Primary -> copy(
+                snapshot = merged,
+                primaryLoading = false,
+                primaryLoaded = true,
+                primaryError = null,
+            )
+            SensorDevice.External -> copy(
+                snapshot = merged,
+                externalLoading = false,
+                externalLoaded = true,
+                externalError = null,
+            )
+        }
+    }
+}
+
+private enum class SensorDevice {
+    Primary,
+    External,
+}
 
 private data class AppRelease(
     val versionName: String,
