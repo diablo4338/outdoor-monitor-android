@@ -1,5 +1,21 @@
 # syntax=docker/dockerfile:1.7
-FROM ghcr.io/cirruslabs/android-sdk:35 AS build
+FROM --platform=linux/amd64 ghcr.io/cirruslabs/android-sdk:35 AS x86-android-runtime
+
+FROM ghcr.io/cirruslabs/android-sdk:35 AS toolchain
+
+# Android's AAPT2 binary is x86_64-only. These libraries let ARM64 runners
+# execute it through the QEMU handler registered by the release workflow.
+COPY --from=x86-android-runtime /lib/x86_64-linux-gnu/ld-linux-x86-64.so.2 /lib64/ld-linux-x86-64.so.2
+COPY --from=x86-android-runtime \
+    /lib/x86_64-linux-gnu/libc.so.6 \
+    /lib/x86_64-linux-gnu/libdl.so.2 \
+    /lib/x86_64-linux-gnu/libgcc_s.so.1 \
+    /lib/x86_64-linux-gnu/libm.so.6 \
+    /lib/x86_64-linux-gnu/libpthread.so.0 \
+    /lib/x86_64-linux-gnu/librt.so.1 \
+    /lib/x86_64-linux-gnu/
+
+FROM toolchain AS build
 
 WORKDIR /workspace
 COPY . ./
@@ -7,6 +23,7 @@ COPY . ./
 ARG VERSION_NAME
 ARG VERSION_CODE
 ARG RELEASE_API_BASE_URL
+ARG RELEASE_API_FALLBACK_BASE_URL
 ARG POLL_INTERVAL_SECONDS=10
 ARG GIT_COMMIT
 ARG PUBLISHED_AT
@@ -16,16 +33,19 @@ RUN --mount=type=secret,id=release_keystore \
     --mount=type=secret,id=signing_store_password \
     --mount=type=secret,id=signing_key_password \
     --mount=type=secret,id=google_web_client_id \
-    --mount=type=cache,id=outdoor-monitor-android-signing,target=/root/.android \
-    --mount=type=cache,target=/root/.gradle \
+    --mount=type=cache,id=outdoor-monitor-android-signing,target=/root/.android,sharing=locked \
+    --mount=type=cache,id=outdoor-monitor-gradle-user-home,target=/root/.gradle,sharing=locked \
+    --mount=type=cache,id=outdoor-monitor-gradle-project,target=/workspace/.gradle,sharing=locked \
+    --mount=type=cache,id=outdoor-monitor-android-build,target=/workspace/app/build,sharing=locked \
     set -eu; \
     case "$VERSION_NAME" in *[!0-9A-Za-z.+-]*) exit 2;; esac; \
     case "$VERSION_CODE" in ''|*[!0-9]*) exit 2;; esac; \
     test -n "$RELEASE_API_BASE_URL"; \
     GOOGLE_WEB_CLIENT_ID="$(cat /run/secrets/google_web_client_id)"; \
     test -n "$GOOGLE_WEB_CLIENT_ID"; \
-    export VERSION_NAME VERSION_CODE RELEASE_API_BASE_URL GOOGLE_WEB_CLIENT_ID POLL_INTERVAL_SECONDS; \
+    export VERSION_NAME VERSION_CODE RELEASE_API_BASE_URL RELEASE_API_FALLBACK_BASE_URL GOOGLE_WEB_CLIENT_ID POLL_INTERVAL_SECONDS; \
     export DEBUG_API_BASE_URL="$RELEASE_API_BASE_URL"; \
+    export DEBUG_API_FALLBACK_BASE_URL="$RELEASE_API_FALLBACK_BASE_URL"; \
     sed -i 's/\r$//' gradlew; \
     chmod +x gradlew; \
     if [ "$BUILD_VARIANT" = release ]; then \

@@ -16,3 +16,4 @@ local.properties
 keystores
 key.jks
 app/release
+.kotlin

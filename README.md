@@ -10,7 +10,9 @@ Copy `local.properties.example` to the Git-ignored `local.properties` file:
 
 ```properties
 DEBUG_API_BASE_URL=http://your-backend-host:8000
+DEBUG_API_FALLBACK_BASE_URL=
 RELEASE_API_BASE_URL=https://your-api.example.com
+RELEASE_API_FALLBACK_BASE_URL=https://your-fallback-api.example.com
 GOOGLE_WEB_CLIENT_ID=your-google-web-client-id
 POLL_INTERVAL_SECONDS=10
 ```
@@ -18,6 +20,10 @@ POLL_INTERVAL_SECONDS=10
 Use `10.0.2.2` to reach the host from Android Emulator. Use the computer's LAN address
 for a physical device. Debug builds allow local HTTP traffic, while release builds
 continue to reject cleartext traffic.
+
+The fallback URL is optional. Requests retry network failures and HTTP `5xx` responses
+with 0.5, 1, and 3 second delays before switching domains. Primary and external sensor
+pages poll independently while the application lifecycle is started.
 
 Build with Gradle from the `client` directory:
 
@@ -27,55 +33,52 @@ Build with Gradle from the `client` directory:
 
 ## Local debug build with an explicit version
 
-Run this from the `client` directory:
+Run this from the repository root:
 
 ```bash
-make apk-build \
-  APK_VERSION_NAME=1.2.7-debug \
-  APK_VERSION_CODE=12007
+make apk-test-publish 1.2.3
 ```
+
+The positional argument is the user-visible version. `VERSION_CODE` is read from
+`docker/releases/latest.json` and incremented automatically.
 
 Additional variables:
 
 - `API_PORT` — API port from `docker/.env`, used by both Compose and the APK;
 - `APK_API_HOST` — API host embedded in the APK (`10.0.2.2` for an emulator);
-- `APK_GOOGLE_CLIENT_ID` — Google web client ID, stored only in `docker/.env`;
-- `APK_POLL_INTERVAL_SECONDS` — weather polling interval.
+- `GOOGLE_WEB_CLIENT_ID` — Google web client ID from `local.properties`;
+- `POLL_INTERVAL_SECONDS` — weather polling interval from `local.properties`.
 
-When `APK_GOOGLE_CLIENT_ID` is empty in `docker/.env`, the local build attempts to
-read `GOOGLE_WEB_CLIENT_ID` from `local.properties`. Both files are ignored by
-Git.
+`local.properties` is ignored by Git.
 
 The build publishes its output into the shared release directory:
 
 ```text
-build/releases/<version_code>/outdoor-monitor-<version_name>-<version_code>.apk
-build/releases/<version_code>/manifest.json
-build/releases/latest.json
+docker/releases/<version_code>/outdoor-monitor-<version_name>-<version_code>-debug.apk
+docker/releases/<version_code>/manifest.json
+docker/releases/latest.json
 ```
 
-The local API sees these files immediately through its Compose volume. For an emulator
-and `API_PORT=8002`, no second port setting is needed. For a physical device, use:
+The local API sees these files immediately through its Compose volume. The API address
+embedded in a local APK comes from `DEBUG_API_BASE_URL` in `local.properties`; use
+`http://10.0.2.2:8005` for the emulator. A physical device should use an HTTPS endpoint.
 
-```dotenv
-make apk-build APK_API_HOST=192.168.1.100
-```
-
-To test the update flow, first build and install an older version:
+To test the update flow, publish and install the first version:
 
 ```bash
-make apk-build APK_VERSION_NAME=1.2.6-debug APK_VERSION_CODE=12006
+make apk-test-publish 1.2.3
 ```
 
 Then publish a newer version without installing it manually:
 
 ```bash
-make apk-build APK_VERSION_NAME=1.2.7-debug APK_VERSION_CODE=12007
+make apk-test-publish 1.2.4
 ```
 
 On startup, the installed client requests `/api/v1/app/latest`, detects the greater
-`version_code`, and displays the download action. The debug keystore is stored in a
-persistent BuildKit cache, so subsequent local APKs retain a compatible signature.
+`version_code`, and displays the download action. Local builds use the standard
+Android debug keystore, so subsequent APKs retain the same signature as builds
+installed from Android Studio on this machine.
 
 ## Production release versions
 
@@ -115,12 +118,14 @@ version base, for example from `1.2.x` to `1.3.0` or `2.0.0`.
 
 ## GitHub Actions configuration
 
-`.github/workflows/android-release.yml` uses a self-hosted Linux runner and the GitHub
-environment named `dev`.
+`.github/workflows/android-release.yml` uses a self-hosted Linux runner (x64 or ARM64)
+and the GitHub environment named `dev`. Buildx retains its state between runs, while
+Gradle user, project, and output directories use locked BuildKit caches.
 
 Under **Settings → Environments → dev → Environment variables**, configure:
 
 - `RELEASE_API_BASE_URL` — public backend URL;
+- `RELEASE_API_FALLBACK_BASE_URL` — optional backup backend URL;
 - `RELEASES_DIR` — publication directory, such as `/srv/outdoor-monitor/releases`;
 - `SIGNING_DIR` — signing directory, such as
   `/var/lib/outdoor-monitor-builder/signing`.

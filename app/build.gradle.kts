@@ -61,6 +61,11 @@ android {
             )
             buildConfigField(
                 "String",
+                "API_FALLBACK_BASE_URL",
+                buildConfigString(envValue("DEBUG_API_FALLBACK_BASE_URL") ?: "")
+            )
+            buildConfigField(
+                "String",
                 "GOOGLE_WEB_CLIENT_ID",
                 buildConfigString(requiredEnvValue("GOOGLE_WEB_CLIENT_ID"))
             )
@@ -91,6 +96,11 @@ android {
                 "String",
                 "API_BASE_URL",
                 buildConfigString(requiredEnvValue("RELEASE_API_BASE_URL"))
+            )
+            buildConfigField(
+                "String",
+                "API_FALLBACK_BASE_URL",
+                buildConfigString(envValue("RELEASE_API_FALLBACK_BASE_URL") ?: "")
             )
             buildConfigField(
                 "String",
