@@ -17,3 +17,4 @@ keystores
 key.jks
 app/release
 .kotlin
+.idea
