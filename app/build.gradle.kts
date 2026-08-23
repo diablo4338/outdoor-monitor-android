@@ -39,12 +39,13 @@ fun requiredEnvInt(name: String): Int {
 
 android {
     namespace = "com.example.metrics"
-    compileSdk = 34
+    compileSdk = 37
 
     defaultConfig {
         applicationId = "com.example.metrics"
         minSdk = 26
-        targetSdk = 34
+        //noinspection EditedTargetSdkVersion
+        targetSdk = 37
         versionCode = envValue("VERSION_CODE")?.toIntOrNull() ?: 1
         versionName = envValue("VERSION_NAME") ?: "1.1-dev"
 
@@ -152,10 +153,12 @@ dependencies {
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.lifecycle.runtime.ktx)
     implementation(libs.androidx.activity.compose)
+    implementation(libs.androidx.lifecycle.viewmodel)
 
     implementation(libs.androidx.compose.ui)
     implementation(libs.androidx.compose.material3)
     implementation(libs.androidx.compose.ui.tooling.preview)
+    implementation(libs.androidx.compose.foundation)
     debugImplementation(libs.androidx.compose.ui.tooling)
 
     testImplementation(libs.junit)
@@ -165,24 +168,6 @@ dependencies {
     androidTestImplementation(libs.androidx.compose.ui.test.junit4)
     debugImplementation(libs.androidx.compose.ui.test.manifest)
 
-    // Compose BOM – управляет версиями
-    implementation(platform("androidx.compose:compose-bom:2024.10.01"))
-
-    // Базовые артефакты Compose
-    implementation("androidx.activity:activity-compose:1.9.3")
-    implementation("androidx.compose.ui:ui")
-    implementation("androidx.compose.material3:material3")
-    implementation("androidx.compose.foundation:foundation")      // <-- НУЖНО ДЛЯ background
-    implementation("androidx.compose.ui:ui-tooling-preview")
-
-    // (опционально, но полезно)
-    implementation("androidx.core:core-ktx:1.13.1")
-    implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.6")
-
-    // Debug tooling
-    debugImplementation("androidx.compose.ui:ui-tooling")
-
-    // Твоя сеть
-    implementation("com.squareup.okhttp3:okhttp:4.11.0")
-    implementation("com.google.android.gms:play-services-auth:21.2.0")
+    implementation(libs.okhttp)
+    implementation(libs.google.auth)
 }

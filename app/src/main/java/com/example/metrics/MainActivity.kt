@@ -17,6 +17,7 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
@@ -61,6 +62,8 @@ import com.google.android.gms.auth.api.signin.GoogleSignInOptions
 import com.google.android.gms.common.api.ApiException
 import com.google.android.gms.tasks.Tasks
 import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.repeatOnLifecycle
 import androidx.core.content.edit
 import androidx.core.net.toUri
@@ -68,6 +71,8 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
@@ -97,8 +102,9 @@ import kotlin.time.Duration.Companion.seconds
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        val weatherViewModel = ViewModelProvider(this)[WeatherViewModel::class.java]
         setContent {
-            MetricsApp()
+            MetricsApp(weatherViewModel)
         }
     }
 }
@@ -140,11 +146,12 @@ private suspend fun loadLatestRelease(): AppRelease? = withContext(Dispatchers.I
     try {
         val request = Request.Builder()
             .url(apiUrl(APP_LATEST_PATH))
+            .tag(IgnoreBackendAvailability::class.java, IgnoreBackendAvailability)
             .get()
             .build()
         httpClient.newCall(request).execute().use { response ->
             if (!response.isSuccessful) return@withContext null
-            val body = response.body?.string() ?: return@withContext null
+            val body = response.body.string()
             val json = JSONObject(body)
             AppRelease(
                 versionName = json.getString("version_name"),
@@ -219,17 +226,18 @@ private fun clearAuthSession(context: Context) {
 }
 
 @Composable
-fun MetricsApp() {
+private fun MetricsApp(weatherViewModel: WeatherViewModel) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val lifecycle = (context as ComponentActivity).lifecycle
     val allBackendsUnavailable by retryInterceptor.allBackendsUnavailable.collectAsState()
-
     var jwt by remember(context) { mutableStateOf(getStoredJwt(context)) }
-    var weatherState by remember { mutableStateOf(WeatherState()) }
+    val weatherState = weatherViewModel.state
     var activeDevice by remember { mutableStateOf(SensorDevice.Primary) }
     var latestRelease by remember { mutableStateOf<AppRelease?>(null) }
     var showVersionDialog by remember { mutableStateOf(false) }
+    var tokenRevision by remember { mutableStateOf(0L) }
+    val tokenRefreshMutex = remember { Mutex() }
     val snackbarHostState = remember { SnackbarHostState() }
     val availableUpdate = latestRelease?.takeIf { it.versionCode > BuildConfig.VERSION_CODE }
 
@@ -237,54 +245,75 @@ fun MetricsApp() {
         device: SensorDevice,
         jwtForRequest: String? = jwt,
         allowGoogleRefresh: Boolean = true,
+        requestTokenRevision: Long = tokenRevision,
     ) {
         if (jwtForRequest.isNullOrBlank()) {
-            weatherState = WeatherState()
+            weatherViewModel.reset()
             return
         }
-        weatherState = weatherState.withLoading(device, true)
+        weatherViewModel.update { it.withLoading(device, true) }
         val result = loadWeather(jwtForRequest, device)
         when (result) {
             is WeatherResult.Success -> {
-                weatherState = weatherState.withSnapshot(device, result.snapshot)
+                weatherViewModel.update { it.withSnapshot(device, result.snapshot) }
             }
             is WeatherResult.Unauthorized -> {
                 if (allowGoogleRefresh && getStoredAuthProvider(context) == AUTH_PROVIDER_GOOGLE) {
-                    val refreshedToken = refreshGoogleBackendToken(context)
+                    val refreshedToken = tokenRefreshMutex.withLock {
+                        if (tokenRevision != requestTokenRevision) {
+                            jwt
+                        } else {
+                            refreshGoogleBackendToken(context).also {
+                                tokenRevision += 1
+                                jwt = it
+                            }
+                        }
+                    }
                     if (refreshedToken != null) {
-                        jwt = refreshedToken
-                        load(device, refreshedToken, allowGoogleRefresh = false)
+                        load(
+                            device = device,
+                            jwtForRequest = refreshedToken,
+                            allowGoogleRefresh = false,
+                            requestTokenRevision = tokenRevision,
+                        )
                         return
                     }
                 }
                 clearAuthSession(context)
                 jwt = null
-                weatherState = WeatherState()
+                weatherViewModel.reset()
             }
             is WeatherResult.Failure -> {
-                weatherState = weatherState.withIssue(
-                    device = device,
-                    message = result.message,
-                    warning = result.warning,
-                    clearData = result.clearData,
-                )
+                weatherViewModel.update {
+                    it.withIssue(
+                        device = device,
+                        message = result.message,
+                        warning = result.warning,
+                        clearData = result.clearData,
+                    )
+                }
             }
         }
     }
 
-    LaunchedEffect(jwt, lifecycle) {
+    LaunchedEffect(jwt) {
         val pollingJwt = jwt?.takeIf { it.isNotBlank() } ?: return@LaunchedEffect
-        lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
-            coroutineScope {
-                launch { load(SensorDevice.Primary, pollingJwt) }
-                launch { load(SensorDevice.External, pollingJwt) }
-            }
+        coroutineScope {
+            launch { load(SensorDevice.Primary, pollingJwt) }
+            launch { load(SensorDevice.External, pollingJwt) }
         }
     }
 
     LaunchedEffect(jwt, lifecycle, activeDevice) {
         val pollingJwt = jwt?.takeIf { it.isNotBlank() } ?: return@LaunchedEffect
         lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
+            val currentStatus = weatherViewModel.state.cardFor(activeDevice).status
+            if (
+                currentStatus != SensorCardStatus.Initial &&
+                currentStatus != SensorCardStatus.Loading
+            ) {
+                load(activeDevice, pollingJwt)
+            }
             while (true) {
                 delay(BuildConfig.POLL_INTERVAL_SECONDS.seconds)
                 load(activeDevice, pollingJwt)
@@ -323,45 +352,47 @@ fun MetricsApp() {
         LoginScreen(
             onPasswordLogin = { username, password ->
                 scope.launch {
-                    weatherState = WeatherState(loading = true)
+                    weatherViewModel.reset(WeatherState(loading = true))
                     when (val result = loginWithPassword(username, password)) {
                         AuthResult.InvalidCredentials -> {
-                            weatherState = WeatherState(error = "Неверный логин или пароль")
+                            weatherViewModel.reset(WeatherState(error = "Неверный логин или пароль"))
                             return@launch
                         }
                         is AuthResult.Failure -> {
-                            weatherState = WeatherState(error = result.message)
+                            weatherViewModel.reset(WeatherState(error = result.message))
                             return@launch
                         }
                         is AuthResult.Success -> {
                             saveAuthSession(context, result.tokens, AUTH_PROVIDER_PASSWORD)
-                            weatherState = WeatherState()
+                            weatherViewModel.reset()
                             jwt = result.tokens.values.first()
+                            tokenRevision += 1
                         }
                     }
                 }
             },
             onGoogleLogin = { idToken ->
                 scope.launch {
-                    weatherState = WeatherState(loading = true)
+                    weatherViewModel.reset(WeatherState(loading = true))
                     when (val result = loginWithGoogle(idToken)) {
                         is AuthResult.Success -> {
                             saveAuthSession(context, result.tokens, AUTH_PROVIDER_GOOGLE)
-                            weatherState = WeatherState()
+                            weatherViewModel.reset()
                             jwt = result.tokens.values.first()
+                            tokenRevision += 1
                         }
                         AuthResult.InvalidCredentials -> {
                             signOutGoogle(context)
                             clearAuthSession(context)
                             jwt = null
-                            weatherState = WeatherState(error = "Google token отклонен backend")
+                            weatherViewModel.reset(WeatherState(error = "Google token отклонен backend"))
                             return@launch
                         }
                         is AuthResult.Failure -> {
                             signOutGoogle(context)
                             clearAuthSession(context)
                             jwt = null
-                            weatherState = WeatherState(error = result.message)
+                            weatherViewModel.reset(WeatherState(error = result.message))
                             return@launch
                         }
                     }
@@ -393,12 +424,14 @@ fun MetricsApp() {
                 if (!jwt.isNullOrBlank()) {
                     IconButton(
                         onClick = {
+                            val tokensForLogout = domainTokens.toMap()
+                            clearAuthSession(context)
+                            jwt = null
+                            tokenRevision += 1
+                            weatherViewModel.reset()
                             scope.launch {
-                                logout()
+                                logout(tokensForLogout)
                                 signOutGoogle(context)
-                                clearAuthSession(context)
-                                jwt = null
-                                weatherState = WeatherState()
                             }
                         },
                     ) {
@@ -470,7 +503,6 @@ private fun WeatherScreen(
     allBackendsUnavailable: Boolean,
     onActiveDeviceChanged: (SensorDevice) -> Unit,
 ) {
-    val snapshot = state.snapshot
     val pagerState = rememberPagerState(pageCount = { 2 })
     var timestampFormatTick by remember { mutableStateOf(System.currentTimeMillis()) }
 
@@ -493,86 +525,86 @@ private fun WeatherScreen(
             .background(Color.Black)
             .padding(24.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.Center
     ) {
-        val displayedLastUpdate = remember(
-            pagerState.currentPage,
-            snapshot,
-            timestampFormatTick,
-        ) {
-            if (pagerState.currentPage == 0) {
-                snapshot?.lastUpdateEpochSeconds?.let(::formatSnapshotTimestamp)
-            } else {
-                snapshot?.externalLastUpdateEpochSeconds?.let(::formatSnapshotTimestamp)
-            }
-        }
+            HorizontalPager(
+                state = pagerState,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .weight(1f),
+            ) { page ->
+                val device = if (page == 0) SensorDevice.Primary else SensorDevice.External
+                val card = state.cardFor(device)
+                val cardStatus = card.status
+                val lastUpdate = remember(page, card.lastUpdateEpochSeconds, timestampFormatTick) {
+                    card.lastUpdateEpochSeconds?.let(::formatSnapshotTimestamp)
+                }
+                val errorText = when {
+                    cardStatus is SensorCardStatus.Error -> cardStatus.message
+                    cardStatus == SensorCardStatus.SensorUnavailable &&
+                        device == SensorDevice.Primary ->
+                        "Сенсор не отвечает - показания не обновлены"
+                    cardStatus == SensorCardStatus.SensorUnavailable ->
+                        "Дополнительный датчик не отвечает"
+                    else -> null
+                }
 
-        HorizontalPager(
-            state = pagerState,
-            modifier = Modifier
-                .fillMaxWidth()
-                .height(260.dp),
-        ) { page ->
-            Box(
-                modifier = Modifier.fillMaxSize(),
-                contentAlignment = Alignment.Center,
-            ) {
-                if (page == 0) {
-                    PrimarySensorCard(snapshot)
-                } else {
-                    ExternalSensorCard(snapshot)
+                Column(
+                    modifier = Modifier.fillMaxSize(),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.Center,
+                ) {
+                    if (page == 0) {
+                        PrimarySensorCard(card)
+                    } else {
+                        ExternalSensorCard(card)
+                    }
+
+                    Spacer(modifier = Modifier.height(24.dp))
+
+                    Text(
+                        text = "Обновлено: ${lastUpdate ?: "-"}",
+                        color = Color(0xFF777777),
+                        fontSize = 18.sp,
+                    )
+
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(52.dp),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        if (errorText != null) {
+                            ErrorText(
+                                text = errorText,
+                                color = if (
+                                    (cardStatus as? SensorCardStatus.Error)?.warning == true
+                                ) {
+                                    Color(0xFFD19A55)
+                                } else {
+                                    Color.Red
+                                },
+                            )
+                        }
+                    }
                 }
             }
-        }
 
-        Text(
-            text = "Обновлено: ${displayedLastUpdate ?: "-"}",
-            color = Color(0xFF777777),
-            fontSize = 18.sp
-        )
-
-        Box(
-            modifier = Modifier
-                .fillMaxWidth()
-                .heightIn(min = 52.dp),
-            contentAlignment = Alignment.Center,
-        ) {
-            val displayedDevice = if (pagerState.currentPage == 0) {
-                SensorDevice.Primary
-            } else {
-                SensorDevice.External
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(min = 52.dp)
+                    .fillMaxHeight(0.1f),
+                contentAlignment = Alignment.Center,
+            ) {
+                if (allBackendsUnavailable) {
+                    CircularProgressIndicator(color = Color(0xFFAAAAAA))
+                }
             }
-            val requestError = state.errorFor(displayedDevice)
-            val requestWarning = state.isWarningFor(displayedDevice)
-            val errorText = when {
-                pagerState.isScrollInProgress -> null
-                requestError != null -> requestError
-                !state.hasLoaded(displayedDevice) -> null
-                snapshot == null -> null
-                pagerState.currentPage == 0 &&
-                    (snapshot.temp == null || snapshot.hum == null) ->
-                    "Сенсор не отвечает - показания не обновлены"
-                pagerState.currentPage == 1 &&
-                    (snapshot.externalTemp == null || snapshot.externalHum == null) ->
-                    "Дополнительный датчик не отвечает"
-                else -> null
-            }
-
-            if (errorText != null) {
-                ErrorText(
-                    text = errorText,
-                    color = if (requestWarning) Color(0xFFD19A55) else Color.Red,
-                )
-            } else if (allBackendsUnavailable && !pagerState.isScrollInProgress) {
-                CircularProgressIndicator(color = Color(0xFFAAAAAA))
-            }
-        }
-
     }
 }
 
 @Composable
-private fun PrimarySensorCard(snapshot: WeatherSnapshot?) {
+private fun PrimarySensorCard(card: SensorCardState) {
     Column(horizontalAlignment = Alignment.CenterHorizontally) {
         Text(
             text = "Основной датчик",
@@ -583,7 +615,7 @@ private fun PrimarySensorCard(snapshot: WeatherSnapshot?) {
         Spacer(modifier = Modifier.height(30.dp))
 
         Text(
-            text = "Температура: ${snapshot?.temp ?: "..."} °C",
+            text = "Температура: ${card.temp ?: "..."} °C",
             color = Color(0xFFEEEEEE),
             fontSize = 36.sp
         )
@@ -591,7 +623,7 @@ private fun PrimarySensorCard(snapshot: WeatherSnapshot?) {
         Spacer(modifier = Modifier.height(20.dp))
 
         Text(
-            text = "Влажность: ${snapshot?.hum ?: "..."} %",
+            text = "Влажность: ${card.hum ?: "..."} %",
             color = Color(0xFFCCCCCC),
             fontSize = 36.sp
         )
@@ -599,7 +631,7 @@ private fun PrimarySensorCard(snapshot: WeatherSnapshot?) {
 }
 
 @Composable
-private fun ExternalSensorCard(snapshot: WeatherSnapshot?) {
+private fun ExternalSensorCard(card: SensorCardState) {
     Column(horizontalAlignment = Alignment.CenterHorizontally) {
         Text(
             text = "Дополнительный датчик",
@@ -610,7 +642,7 @@ private fun ExternalSensorCard(snapshot: WeatherSnapshot?) {
         Spacer(modifier = Modifier.height(30.dp))
 
         Text(
-            text = "Температура: ${snapshot?.externalTemp ?: "..."} °C",
+            text = "Температура: ${card.temp ?: "..."} °C",
             color = Color(0xFFEEEEEE),
             fontSize = 36.sp
         )
@@ -618,7 +650,7 @@ private fun ExternalSensorCard(snapshot: WeatherSnapshot?) {
         Spacer(modifier = Modifier.height(20.dp))
 
         Text(
-            text = "Влажность: ${snapshot?.externalHum ?: "..."} %",
+            text = "Влажность: ${card.hum ?: "..."} %",
             color = Color(0xFFCCCCCC),
             fontSize = 36.sp
         )
@@ -866,8 +898,8 @@ private suspend fun fetchWeatherMetrics(jwt: String?, device: SensorDevice): Fet
                 when {
                     response.code == 401 -> FetchResponse.Unauthorized
                     !response.isSuccessful -> {
-                        val text = response.body?.string()
-                        val controlled = if (response.code == 400 && !text.isNullOrBlank()) {
+                        val text = response.body.string()
+                        val controlled = if (response.code == 400 && text.isNotBlank()) {
                             try {
                                 val json = JSONObject(text)
                                 val message = json.optString("message").takeIf { it.isNotBlank() }
@@ -886,8 +918,8 @@ private suspend fun fetchWeatherMetrics(jwt: String?, device: SensorDevice): Fet
                         controlled ?: FetchResponse.Failure.HttpStatus(response.code)
                     }
                     else -> {
-                        val text = response.body?.string()
-                        if (text.isNullOrBlank()) {
+                        val text = response.body.string()
+                        if (text.isBlank()) {
                             FetchResponse.Failure.EmptyBody
                         } else {
                             try {
@@ -935,24 +967,23 @@ private suspend fun exchangeToken(path: String, payload: String): AuthResult {
         val tokens = mutableMapOf<String, String>()
         var invalidCredentials = false
         var visibleFailure: String? = null
-        var receivedNon5xx = false
         backendBaseUrls.forEach { baseUrl ->
             try {
                 val request = Request.Builder()
                     .url(baseUrl.resolve(path)!!)
                     .tag(PinnedBackend::class.java, PinnedBackend(baseUrl))
+                    .tag(IgnoreBackendAvailability::class.java, IgnoreBackendAvailability)
                     .post(payload.toRequestBody(jsonMediaType))
                     .build()
 
                 httpClient.newCall(request).execute().use { response ->
-                    receivedNon5xx = receivedNon5xx || response.code !in 500..599
                     when {
                         response.code == 401 || response.code == 403 -> invalidCredentials = true
                         response.code in 500..599 -> Unit
                         !response.isSuccessful -> visibleFailure = "Backend вернул HTTP ${response.code} при входе"
                         else -> {
-                            val text = response.body?.string()
-                            val token = if (text.isNullOrBlank()) null else try {
+                            val text = response.body.string()
+                            val token = if (text.isBlank()) null else try {
                                 JSONObject(text).optString("access_token").takeIf { it.isNotBlank() }
                             } catch (_: JSONException) {
                                 null
@@ -970,7 +1001,6 @@ private suspend fun exchangeToken(path: String, payload: String): AuthResult {
             } catch (_: IOException) {
             }
         }
-        if (receivedNon5xx) retryInterceptor.reportReachableBackend()
         when {
             tokens.isNotEmpty() -> AuthResult.Success(tokens)
             invalidCredentials -> AuthResult.InvalidCredentials
@@ -979,13 +1009,18 @@ private suspend fun exchangeToken(path: String, payload: String): AuthResult {
     }
 }
 
-private suspend fun logout() {
+private suspend fun logout(tokens: Map<String, String>) {
     withContext(Dispatchers.IO) {
-        backendBaseUrls.filter { domainTokens.containsKey(it.origin()) }.forEach { baseUrl ->
+        backendBaseUrls.filter { tokens.containsKey(it.origin()) }.forEach { baseUrl ->
             try {
                 val request = Request.Builder()
                     .url(baseUrl.resolve(LOGOUT_PATH)!!)
                     .tag(PinnedBackend::class.java, PinnedBackend(baseUrl))
+                    .tag(IgnoreBackendAvailability::class.java, IgnoreBackendAvailability)
+                    .tag(
+                        RoutedAuthorization::class.java,
+                        RoutedAuthorization(tokens.getValue(baseUrl.origin())),
+                    )
                     .post(ByteArray(0).toRequestBody())
                     .header("Authorization", "Bearer routed-by-interceptor")
                     .build()
@@ -1092,37 +1127,37 @@ private fun formatMetricValue(value: Double): String {
     return "%.0f".format(Locale.US, value)
 }
 
-private data class WeatherState(
-    val snapshot: WeatherSnapshot? = null,
+internal class WeatherViewModel : ViewModel() {
+    var state by mutableStateOf(WeatherState())
+        private set
+
+    fun update(transform: (WeatherState) -> WeatherState) {
+        state = transform(state)
+    }
+
+    fun reset(newState: WeatherState = WeatherState()) {
+        state = newState
+    }
+}
+
+internal data class WeatherState(
     val error: String? = null,
     val loading: Boolean = false,
-    val primaryError: String? = null,
-    val externalError: String? = null,
-    val primaryWarning: Boolean = false,
-    val externalWarning: Boolean = false,
-    val primaryLoading: Boolean = false,
-    val externalLoading: Boolean = false,
-    val primaryLoaded: Boolean = false,
-    val externalLoaded: Boolean = false,
+    val primaryCard: SensorCardState = SensorCardState(),
+    val externalCard: SensorCardState = SensorCardState(),
 ) {
-    fun errorFor(device: SensorDevice): String? = error ?: when (device) {
-        SensorDevice.Primary -> primaryError
-        SensorDevice.External -> externalError
+    fun cardFor(device: SensorDevice): SensorCardState = when (device) {
+        SensorDevice.Primary -> primaryCard
+        SensorDevice.External -> externalCard
     }
 
-    fun isWarningFor(device: SensorDevice): Boolean = when (device) {
-        SensorDevice.Primary -> primaryWarning
-        SensorDevice.External -> externalWarning
-    }
-
-    fun hasLoaded(device: SensorDevice): Boolean = when (device) {
-        SensorDevice.Primary -> primaryLoaded
-        SensorDevice.External -> externalLoaded
-    }
-
-    fun withLoading(device: SensorDevice, value: Boolean): WeatherState = when (device) {
-        SensorDevice.Primary -> copy(primaryLoading = value, primaryError = null)
-        SensorDevice.External -> copy(externalLoading = value, externalError = null)
+    fun withLoading(device: SensorDevice, value: Boolean): WeatherState {
+        val card = cardFor(device)
+        if (!value || card.status != SensorCardStatus.Initial) return this
+        return when (device) {
+            SensorDevice.Primary -> copy(primaryCard = card.copy(status = SensorCardStatus.Loading))
+            SensorDevice.External -> copy(externalCard = card.copy(status = SensorCardStatus.Loading))
+        }
     }
 
     fun withIssue(
@@ -1131,74 +1166,66 @@ private data class WeatherState(
         warning: Boolean,
         clearData: Boolean,
     ): WeatherState {
-        val updatedSnapshot = if (!clearData) snapshot else when (device) {
-            SensorDevice.Primary -> snapshot?.copy(
-                temp = null,
-                hum = null,
-                lastUpdateEpochSeconds = null,
-            )
-            SensorDevice.External -> snapshot?.copy(
-                externalTemp = null,
-                externalHum = null,
-                externalLastUpdateEpochSeconds = null,
-            )
-        }
+        // Backend availability is global and must not mutate a sensor card state.
+        if (message == null) return this
+        val card = cardFor(device)
+        val updatedCard = card.copy(
+            temp = if (clearData) null else card.temp,
+            hum = if (clearData) null else card.hum,
+            lastUpdateEpochSeconds = if (clearData) null else card.lastUpdateEpochSeconds,
+            status = SensorCardStatus.Error(message, warning),
+        )
         return when (device) {
-            SensorDevice.Primary -> copy(
-                snapshot = updatedSnapshot,
-                primaryLoading = false,
-                primaryError = message,
-                primaryWarning = warning,
-            )
-            SensorDevice.External -> copy(
-                snapshot = updatedSnapshot,
-                externalLoading = false,
-                externalError = message,
-                externalWarning = warning,
-            )
+            SensorDevice.Primary -> copy(primaryCard = updatedCard)
+            SensorDevice.External -> copy(externalCard = updatedCard)
         }
     }
 
     fun withSnapshot(device: SensorDevice, update: WeatherSnapshot): WeatherState {
-        val current = snapshot
-        val merged = when (device) {
-            SensorDevice.Primary -> WeatherSnapshot(
+        val updatedCard = when (device) {
+            SensorDevice.Primary -> SensorCardState(
                 temp = update.temp,
                 hum = update.hum,
-                externalTemp = current?.externalTemp,
-                externalHum = current?.externalHum,
                 lastUpdateEpochSeconds = update.lastUpdateEpochSeconds,
-                externalLastUpdateEpochSeconds = current?.externalLastUpdateEpochSeconds,
+                status = statusForValues(update.temp, update.hum),
             )
-            SensorDevice.External -> WeatherSnapshot(
-                temp = current?.temp,
-                hum = current?.hum,
-                externalTemp = update.externalTemp,
-                externalHum = update.externalHum,
-                lastUpdateEpochSeconds = current?.lastUpdateEpochSeconds,
-                externalLastUpdateEpochSeconds = update.externalLastUpdateEpochSeconds,
+            SensorDevice.External -> SensorCardState(
+                temp = update.externalTemp,
+                hum = update.externalHum,
+                lastUpdateEpochSeconds = update.externalLastUpdateEpochSeconds,
+                status = statusForValues(update.externalTemp, update.externalHum),
             )
         }
         return when (device) {
-            SensorDevice.Primary -> copy(
-                snapshot = merged,
-                primaryLoading = false,
-                primaryLoaded = true,
-                primaryError = null,
-                primaryWarning = false,
-            )
-            SensorDevice.External -> copy(
-                snapshot = merged,
-                externalLoading = false,
-                externalLoaded = true,
-                externalError = null,
-                externalWarning = false,
-            )
+            SensorDevice.Primary -> copy(primaryCard = updatedCard)
+            SensorDevice.External -> copy(externalCard = updatedCard)
         }
     }
+
+    private fun statusForValues(temp: String?, hum: String?): SensorCardStatus =
+        if (temp == null || hum == null) {
+            SensorCardStatus.SensorUnavailable
+        } else {
+            SensorCardStatus.Ready
+        }
 }
 
-private enum class SensorDevice {
+internal data class SensorCardState(
+    val temp: String? = null,
+    val hum: String? = null,
+    val lastUpdateEpochSeconds: Long? = null,
+    val status: SensorCardStatus = SensorCardStatus.Initial,
+)
+
+internal sealed interface SensorCardStatus {
+    data object Initial : SensorCardStatus
+    data object Loading : SensorCardStatus
+    data object Ready : SensorCardStatus
+    data object SensorUnavailable : SensorCardStatus
+    data class Error(val message: String, val warning: Boolean) : SensorCardStatus
+}
+
+internal enum class SensorDevice {
     Primary,
     External,
 }
@@ -1209,7 +1236,7 @@ private data class AppRelease(
     val downloadUrl: String,
 )
 
-private data class WeatherSnapshot(
+internal data class WeatherSnapshot(
     val temp: String?,
     val hum: String?,
     val externalTemp: String?,

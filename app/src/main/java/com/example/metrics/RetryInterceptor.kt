@@ -10,6 +10,22 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 
 internal data class PinnedBackend(val baseUrl: HttpUrl)
+internal data class RoutedAuthorization(val token: String)
+internal data object IgnoreBackendAvailability
+
+internal class BackendAvailabilityTracker {
+    private val _unavailable = MutableStateFlow(false)
+    val unavailable: StateFlow<Boolean> = _unavailable
+    private var lastRequestId = 0L
+
+    @Synchronized
+    fun report(requestId: Long, available: Boolean) {
+        if (requestId < lastRequestId) return
+        lastRequestId = requestId
+        _unavailable.value = !available
+    }
+
+}
 
 internal class RetryInterceptor(
     private val primaryBaseUrl: HttpUrl,
@@ -18,12 +34,8 @@ internal class RetryInterceptor(
     private val retryDelaysMs: List<Long> = listOf(500L, 1_000L, 3_000L),
     private val primaryProbeIntervalMs: Long = 30_000L,
 ) : Interceptor {
-    private val _allBackendsUnavailable = MutableStateFlow(false)
-    val allBackendsUnavailable: StateFlow<Boolean> = _allBackendsUnavailable
-
-    fun reportReachableBackend() {
-        _allBackendsUnavailable.value = false
-    }
+    private val availabilityTracker = BackendAvailabilityTracker()
+    val allBackendsUnavailable: StateFlow<Boolean> = availabilityTracker.unavailable
 
     init {
         require(retryDelaysMs.all { it >= 0 })
@@ -32,6 +44,7 @@ internal class RetryInterceptor(
     override fun intercept(chain: Interceptor.Chain): Response {
         val request = chain.request()
         val requestId = requestSequence.incrementAndGet()
+        val trackAvailability = request.tag(IgnoreBackendAvailability::class.java) == null
         val candidates = request.tag(PinnedBackend::class.java)?.let { listOf(it.baseUrl) } ?: synchronized(lock) {
             val now = System.currentTimeMillis()
             when {
@@ -56,7 +69,9 @@ internal class RetryInterceptor(
                 )
             if (request.header("Authorization") != null) {
                 requestBuilder.removeHeader("Authorization")
-                tokenProvider(baseUrl)?.let { requestBuilder.header("Authorization", "Bearer $it") }
+                val token = request.tag(RoutedAuthorization::class.java)?.token
+                    ?: tokenProvider(baseUrl)
+                token?.let { requestBuilder.header("Authorization", "Bearer $it") }
             }
             val routedRequest = requestBuilder.build()
 
@@ -64,7 +79,7 @@ internal class RetryInterceptor(
                 try {
                     val response = chain.proceed(routedRequest)
                     if (response.code !in 500..599) {
-                        markAvailable(requestId, baseUrl)
+                        markAvailable(requestId, baseUrl, trackAvailability)
                         return response
                     }
                     if (attempt == retryDelaysMs.size) {
@@ -73,7 +88,7 @@ internal class RetryInterceptor(
                             Log.w(TAG, "Backend ${baseUrl.redact()} unavailable; using fallback")
                             break
                         }
-                        markUnavailable(requestId)
+                        markUnavailable(requestId, trackAvailability)
                         return response
                     }
                     response.close()
@@ -81,7 +96,7 @@ internal class RetryInterceptor(
                 } catch (error: IOException) {
                     if (attempt == retryDelaysMs.size) {
                         if (candidateIndex < candidates.lastIndex) break
-                        markUnavailable(requestId)
+                        markUnavailable(requestId, trackAvailability)
                         throw error
                     }
                     waitForRetry(attempt, routedRequest.url.redact(), error.javaClass.simpleName)
@@ -91,18 +106,16 @@ internal class RetryInterceptor(
         error("Retry loop completed unexpectedly")
     }
 
-    private fun markAvailable(requestId: Long, baseUrl: HttpUrl) = synchronized(lock) {
-        _allBackendsUnavailable.value = false
+    private fun markAvailable(requestId: Long, baseUrl: HttpUrl, trackAvailability: Boolean) = synchronized(lock) {
+        if (trackAvailability) availabilityTracker.report(requestId, available = true)
         if (requestId > lastCompletedRequestId) {
             activeBaseUrl = baseUrl
             lastCompletedRequestId = requestId
         }
     }
 
-    private fun markUnavailable(requestId: Long) = synchronized(lock) {
-        if (requestId >= lastCompletedRequestId) {
-            _allBackendsUnavailable.value = true
-        }
+    private fun markUnavailable(requestId: Long, trackAvailability: Boolean) {
+        if (trackAvailability) availabilityTracker.report(requestId, available = false)
     }
 
     private fun waitForRetry(attempt: Int, url: String, reason: String) {
