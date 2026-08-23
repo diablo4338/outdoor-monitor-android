@@ -6,7 +6,15 @@ APK_OUTPUT_DIR := build/local-apk
 RELEASES_DIR := ../docker/releases
 PYTHON := $(abspath ../.venv/bin/python)
 
-.PHONY: apk-local-build apk-test-publish
+.PHONY: tag apk-local-build apk-test-publish
+
+tag:
+	@test -n "$(VERSION_NAME)" || (echo "Usage: make tag app-v1.2.3" >&2; exit 2)
+	@git check-ref-format "refs/tags/$(VERSION_NAME)" >/dev/null || (echo "Invalid tag: $(VERSION_NAME)" >&2; exit 2)
+	git fetch --tags origin
+	@if git rev-parse --verify --quiet "refs/tags/$(VERSION_NAME)" >/dev/null; then echo "Tag already exists: $(VERSION_NAME)" >&2; exit 1; fi
+	git tag -a "$(VERSION_NAME)" -m "Release $(VERSION_NAME)"
+	git push origin "$(VERSION_NAME)"
 
 apk-local-build:
 	@test -n "$(VERSION_NAME)" || (echo "Usage: make apk-local-build 1.2.5" >&2; exit 2)

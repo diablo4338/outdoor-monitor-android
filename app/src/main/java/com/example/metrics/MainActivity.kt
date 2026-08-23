@@ -65,6 +65,7 @@ import androidx.lifecycle.repeatOnLifecycle
 import androidx.core.content.edit
 import androidx.core.net.toUri
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -242,7 +243,7 @@ fun MetricsApp() {
             return
         }
         weatherState = weatherState.withLoading(device, true)
-        val result = loadWeather(context, jwtForRequest, device)
+        val result = loadWeather(jwtForRequest, device)
         when (result) {
             is WeatherResult.Success -> {
                 weatherState = weatherState.withSnapshot(device, result.snapshot)
@@ -261,16 +262,22 @@ fun MetricsApp() {
                 weatherState = WeatherState()
             }
             is WeatherResult.Failure -> {
-                weatherState = if (result.message == null) {
-                    weatherState.withLoading(device, false)
-                } else {
-                    weatherState.withIssue(
-                        device = device,
-                        message = result.message,
-                        warning = result.warning,
-                        clearData = result.clearData,
-                    )
-                }
+                weatherState = weatherState.withIssue(
+                    device = device,
+                    message = result.message,
+                    warning = result.warning,
+                    clearData = result.clearData,
+                )
+            }
+        }
+    }
+
+    LaunchedEffect(jwt, lifecycle) {
+        val pollingJwt = jwt?.takeIf { it.isNotBlank() } ?: return@LaunchedEffect
+        lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
+            coroutineScope {
+                launch { load(SensorDevice.Primary, pollingJwt) }
+                launch { load(SensorDevice.External, pollingJwt) }
             }
         }
     }
@@ -279,8 +286,8 @@ fun MetricsApp() {
         val pollingJwt = jwt?.takeIf { it.isNotBlank() } ?: return@LaunchedEffect
         lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
             while (true) {
-                load(activeDevice, pollingJwt)
                 delay(BuildConfig.POLL_INTERVAL_SECONDS.seconds)
+                load(activeDevice, pollingJwt)
             }
         }
     }
@@ -330,7 +337,6 @@ fun MetricsApp() {
                             saveAuthSession(context, result.tokens, AUTH_PROVIDER_PASSWORD)
                             weatherState = WeatherState()
                             jwt = result.tokens.values.first()
-                            load(SensorDevice.Primary, jwt)
                         }
                     }
                 }
@@ -466,6 +472,14 @@ private fun WeatherScreen(
 ) {
     val snapshot = state.snapshot
     val pagerState = rememberPagerState(pageCount = { 2 })
+    var timestampFormatTick by remember { mutableStateOf(System.currentTimeMillis()) }
+
+    LaunchedEffect(Unit) {
+        while (true) {
+            delay(60.seconds)
+            timestampFormatTick = System.currentTimeMillis()
+        }
+    }
 
     LaunchedEffect(pagerState.currentPage) {
         onActiveDeviceChanged(
@@ -481,10 +495,16 @@ private fun WeatherScreen(
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.Center
     ) {
-        val displayedLastUpdate = if (pagerState.currentPage == 0) {
-            snapshot?.lastUpdate
-        } else {
-            snapshot?.externalLastUpdate
+        val displayedLastUpdate = remember(
+            pagerState.currentPage,
+            snapshot,
+            timestampFormatTick,
+        ) {
+            if (pagerState.currentPage == 0) {
+                snapshot?.lastUpdateEpochSeconds?.let(::formatSnapshotTimestamp)
+            } else {
+                snapshot?.externalLastUpdateEpochSeconds?.let(::formatSnapshotTimestamp)
+            }
         }
 
         HorizontalPager(
@@ -538,13 +558,13 @@ private fun WeatherScreen(
                 else -> null
             }
 
-            if (allBackendsUnavailable && !pagerState.isScrollInProgress) {
-                CircularProgressIndicator(color = Color(0xFFAAAAAA))
-            } else if (errorText != null) {
+            if (errorText != null) {
                 ErrorText(
                     text = errorText,
                     color = if (requestWarning) Color(0xFFD19A55) else Color.Red,
                 )
+            } else if (allBackendsUnavailable && !pagerState.isScrollInProgress) {
+                CircularProgressIndicator(color = Color(0xFFAAAAAA))
             }
         }
 
@@ -766,7 +786,6 @@ private fun ErrorText(
 }
 
 private suspend fun loadWeather(
-    context: Context,
     jwt: String?,
     device: SensorDevice,
 ): WeatherResult {
@@ -804,8 +823,8 @@ private suspend fun loadWeather(
                         hum = hum,
                         externalTemp = externalTemp,
                         externalHum = externalHum,
-                        lastUpdate = metricTimestamp?.let(::formatSnapshotTimestamp),
-                        externalLastUpdate = externalMetricTimestamp?.let(::formatSnapshotTimestamp),
+                        lastUpdateEpochSeconds = metricTimestamp,
+                        externalLastUpdateEpochSeconds = externalMetricTimestamp,
                     )
                 )
             } catch (_: JSONException) {
@@ -949,7 +968,6 @@ private suspend fun exchangeToken(path: String, payload: String): AuthResult {
             } catch (_: SSLException) {
                 visibleFailure = "TLS/SSL ошибка при подключении к backend"
             } catch (_: IOException) {
-                Unit
             }
         }
         if (receivedNon5xx) retryInterceptor.reportReachableBackend()
@@ -973,7 +991,6 @@ private suspend fun logout() {
                     .build()
                 httpClient.newCall(request).execute().close()
             } catch (_: IOException) {
-                Unit
             }
         }
     }
@@ -1093,11 +1110,6 @@ private data class WeatherState(
         SensorDevice.External -> externalError
     }
 
-    fun isLoadingFor(device: SensorDevice): Boolean = when (device) {
-        SensorDevice.Primary -> primaryLoading
-        SensorDevice.External -> externalLoading
-    }
-
     fun isWarningFor(device: SensorDevice): Boolean = when (device) {
         SensorDevice.Primary -> primaryWarning
         SensorDevice.External -> externalWarning
@@ -1115,16 +1127,20 @@ private data class WeatherState(
 
     fun withIssue(
         device: SensorDevice,
-        message: String,
+        message: String?,
         warning: Boolean,
         clearData: Boolean,
     ): WeatherState {
         val updatedSnapshot = if (!clearData) snapshot else when (device) {
-            SensorDevice.Primary -> snapshot?.copy(temp = null, hum = null, lastUpdate = null)
+            SensorDevice.Primary -> snapshot?.copy(
+                temp = null,
+                hum = null,
+                lastUpdateEpochSeconds = null,
+            )
             SensorDevice.External -> snapshot?.copy(
                 externalTemp = null,
                 externalHum = null,
-                externalLastUpdate = null,
+                externalLastUpdateEpochSeconds = null,
             )
         }
         return when (device) {
@@ -1151,16 +1167,16 @@ private data class WeatherState(
                 hum = update.hum,
                 externalTemp = current?.externalTemp,
                 externalHum = current?.externalHum,
-                lastUpdate = update.lastUpdate,
-                externalLastUpdate = current?.externalLastUpdate,
+                lastUpdateEpochSeconds = update.lastUpdateEpochSeconds,
+                externalLastUpdateEpochSeconds = current?.externalLastUpdateEpochSeconds,
             )
             SensorDevice.External -> WeatherSnapshot(
                 temp = current?.temp,
                 hum = current?.hum,
                 externalTemp = update.externalTemp,
                 externalHum = update.externalHum,
-                lastUpdate = current?.lastUpdate,
-                externalLastUpdate = update.externalLastUpdate,
+                lastUpdateEpochSeconds = current?.lastUpdateEpochSeconds,
+                externalLastUpdateEpochSeconds = update.externalLastUpdateEpochSeconds,
             )
         }
         return when (device) {
@@ -1198,8 +1214,8 @@ private data class WeatherSnapshot(
     val hum: String?,
     val externalTemp: String?,
     val externalHum: String?,
-    val lastUpdate: String?,
-    val externalLastUpdate: String?,
+    val lastUpdateEpochSeconds: Long?,
+    val externalLastUpdateEpochSeconds: Long?,
 )
 
 private sealed interface WeatherResult {
