@@ -5,12 +5,14 @@ package com.example.metrics
 import android.content.Context
 import android.content.Intent
 import android.os.Bundle
+import android.os.SystemClock
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -24,10 +26,13 @@ import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.rememberPagerState
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.Checkbox
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.OutlinedTextField
@@ -68,7 +73,6 @@ import androidx.lifecycle.repeatOnLifecycle
 import androidx.core.content.edit
 import androidx.core.net.toUri
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
@@ -77,6 +81,7 @@ import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.HttpUrl.Companion.toHttpUrl
+import okhttp3.Interceptor
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -138,6 +143,7 @@ private val httpClient = OkHttpClient.Builder()
     .connectTimeout(5, TimeUnit.SECONDS)
     .readTimeout(5, TimeUnit.SECONDS)
     .addInterceptor(retryInterceptor)
+    .addNetworkInterceptor(RequestTimingNetworkInterceptor())
     .build()
 
 private fun apiUrl(path: String): String = BuildConfig.API_BASE_URL.trimEnd('/') + path
@@ -234,6 +240,7 @@ private fun MetricsApp(weatherViewModel: WeatherViewModel) {
     var jwt by remember(context) { mutableStateOf(getStoredJwt(context)) }
     val weatherState = weatherViewModel.state
     var activeDevice by remember { mutableStateOf(SensorDevice.Primary) }
+    var showRequestLog by remember { mutableStateOf(false) }
     var latestRelease by remember { mutableStateOf<AppRelease?>(null) }
     var showVersionDialog by remember { mutableStateOf(false) }
     var tokenRevision by remember { mutableStateOf(0L) }
@@ -252,7 +259,30 @@ private fun MetricsApp(weatherViewModel: WeatherViewModel) {
             return
         }
         weatherViewModel.update { it.withLoading(device, true) }
-        val result = loadWeather(jwtForRequest, device)
+        val requestTrace = RequestTimingTrace()
+        val requestStartedAtMillis = System.currentTimeMillis()
+        val requestStartedAtNanos = SystemClock.elapsedRealtimeNanos()
+        val result = loadWeather(jwtForRequest, device, requestTrace)
+        val requestElapsedMillis =
+            (SystemClock.elapsedRealtimeNanos() - requestStartedAtNanos) / 1_000_000
+        val requestFinishedAtMillis = System.currentTimeMillis()
+        weatherViewModel.update {
+            it.withRequestLog(
+                ClientRequestLog(
+                    device = device,
+                    path = if (device == SensorDevice.Primary) {
+                        PRIMARY_WEATHER_PATH
+                    } else {
+                        EXTERNAL_WEATHER_PATH
+                    },
+                    startedAtMillis = requestStartedAtMillis,
+                    finishedAtMillis = requestFinishedAtMillis,
+                    elapsedMillis = requestElapsedMillis,
+                    attempts = requestTrace.snapshot(),
+                    result = result.logLabel(),
+                )
+            )
+        }
         when (result) {
             is WeatherResult.Success -> {
                 weatherViewModel.update { it.withSnapshot(device, result.snapshot) }
@@ -296,22 +326,11 @@ private fun MetricsApp(weatherViewModel: WeatherViewModel) {
         }
     }
 
-    LaunchedEffect(jwt) {
-        val pollingJwt = jwt?.takeIf { it.isNotBlank() } ?: return@LaunchedEffect
-        coroutineScope {
-            launch { load(SensorDevice.Primary, pollingJwt) }
-            launch { load(SensorDevice.External, pollingJwt) }
-        }
-    }
-
     LaunchedEffect(jwt, lifecycle, activeDevice) {
         val pollingJwt = jwt?.takeIf { it.isNotBlank() } ?: return@LaunchedEffect
         lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
             val currentStatus = weatherViewModel.state.cardFor(activeDevice).status
-            if (
-                currentStatus != SensorCardStatus.Initial &&
-                currentStatus != SensorCardStatus.Loading
-            ) {
+            if (currentStatus != SensorCardStatus.Loading) {
                 load(activeDevice, pollingJwt)
             }
             while (true) {
@@ -405,9 +424,29 @@ private fun MetricsApp(weatherViewModel: WeatherViewModel) {
         WeatherScreen(
             state = weatherState,
             allBackendsUnavailable = allBackendsUnavailable,
+            showRequestLog = showRequestLog,
             onActiveDeviceChanged = { activeDevice = it },
         )
     }
+
+            if (!jwt.isNullOrBlank()) {
+                Row(
+                    modifier = Modifier
+                        .align(Alignment.TopStart)
+                        .padding(12.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        text = "Лог",
+                        color = Color(0xFFAAAAAA),
+                        fontSize = 14.sp,
+                    )
+                    Checkbox(
+                        checked = showRequestLog,
+                        onCheckedChange = { showRequestLog = it },
+                    )
+                }
+            }
 
             Row(
                 modifier = Modifier
@@ -501,6 +540,7 @@ private fun VersionDialog(
 private fun WeatherScreen(
     state: WeatherState,
     allBackendsUnavailable: Boolean,
+    showRequestLog: Boolean,
     onActiveDeviceChanged: (SensorDevice) -> Unit,
 ) {
     val pagerState = rememberPagerState(pageCount = { 2 })
@@ -589,6 +629,11 @@ private fun WeatherScreen(
                 }
             }
 
+            if (showRequestLog) {
+                ClientRequestLogPanel(state.requestLogs)
+                Spacer(modifier = Modifier.height(12.dp))
+            }
+
             Box(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -600,6 +645,77 @@ private fun WeatherScreen(
                     CircularProgressIndicator(color = Color(0xFFAAAAAA))
                 }
             }
+    }
+}
+
+@Composable
+private fun ClientRequestLogPanel(entries: List<ClientRequestLog>) {
+    val scrollState = rememberScrollState()
+
+    LaunchedEffect(entries.size) {
+        scrollState.scrollTo(scrollState.maxValue)
+    }
+
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .heightIn(min = 96.dp, max = 180.dp)
+            .border(1.dp, Color(0xFF444444))
+            .background(Color(0xFF101010))
+            .padding(10.dp)
+            .verticalScroll(scrollState),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        Text(
+            text = "Запросы клиента",
+            color = Color(0xFFAAAAAA),
+            fontSize = 14.sp,
+        )
+        if (entries.isEmpty()) {
+            Text(
+                text = "Запросов пока нет",
+                color = Color(0xFF777777),
+                fontSize = 13.sp,
+            )
+        } else {
+            entries.forEach { entry ->
+                val deviceLabel = when (entry.device) {
+                    SensorDevice.Primary -> "основной"
+                    SensorDevice.External -> "дополнительный"
+                }
+                Text(
+                    text = buildString {
+                        append("→ ")
+                        append(formatClientLogTimestamp(entry.startedAtMillis))
+                        append("  GET ")
+                        append(entry.path)
+                        append("  [")
+                        append(deviceLabel)
+                        append("]")
+                        entry.attempts.forEachIndexed { index, attempt ->
+                            append("\n  #")
+                            append(index + 1)
+                            append(" ")
+                            append(attempt.host)
+                            append("  ")
+                            append(attempt.status)
+                            append("  ")
+                            append(attempt.elapsedMillis)
+                            append(" мс")
+                        }
+                        append("\n← ")
+                        append(formatClientLogTimestamp(entry.finishedAtMillis))
+                        append("  ")
+                        append(entry.result)
+                        append("  •  ")
+                        append(entry.elapsedMillis)
+                        append(" мс")
+                    },
+                    color = Color(0xFFCCCCCC),
+                    fontSize = 12.sp,
+                )
+            }
+        }
     }
 }
 
@@ -820,8 +936,9 @@ private fun ErrorText(
 private suspend fun loadWeather(
     jwt: String?,
     device: SensorDevice,
+    requestTrace: RequestTimingTrace,
 ): WeatherResult {
-    return when (val response = fetchWeatherMetrics(jwt, device)) {
+    return when (val response = fetchWeatherMetrics(jwt, device, requestTrace)) {
         FetchResponse.Unauthorized -> WeatherResult.Unauthorized
         is FetchResponse.Failure -> response.toWeatherFailure()
         is FetchResponse.Success -> {
@@ -880,7 +997,15 @@ private fun formatSnapshotTimestamp(epochSeconds: Long): String {
     return SimpleDateFormat(pattern, Locale.getDefault()).format(timestamp)
 }
 
-private suspend fun fetchWeatherMetrics(jwt: String?, device: SensorDevice): FetchResponse {
+private fun formatClientLogTimestamp(epochMillis: Long): String {
+    return SimpleDateFormat("HH:mm:ss.SSS", Locale.getDefault()).format(Date(epochMillis))
+}
+
+private suspend fun fetchWeatherMetrics(
+    jwt: String?,
+    device: SensorDevice,
+    requestTrace: RequestTimingTrace,
+): FetchResponse {
     return withContext(Dispatchers.IO) {
         val requestUrl = apiUrl(
             if (device == SensorDevice.Primary) PRIMARY_WEATHER_PATH else EXTERNAL_WEATHER_PATH
@@ -889,6 +1014,7 @@ private suspend fun fetchWeatherMetrics(jwt: String?, device: SensorDevice): Fet
             val requestBuilder = Request.Builder()
                 .url(requestUrl)
                 .get()
+                .tag(RequestTimingTrace::class.java, requestTrace)
 
             if (!jwt.isNullOrBlank()) {
                 requestBuilder.header("Authorization", "Bearer routed-by-interceptor")
@@ -1145,6 +1271,7 @@ internal data class WeatherState(
     val loading: Boolean = false,
     val primaryCard: SensorCardState = SensorCardState(),
     val externalCard: SensorCardState = SensorCardState(),
+    val requestLogs: List<ClientRequestLog> = emptyList(),
 ) {
     fun cardFor(device: SensorDevice): SensorCardState = when (device) {
         SensorDevice.Primary -> primaryCard
@@ -1202,6 +1329,10 @@ internal data class WeatherState(
         }
     }
 
+    fun withRequestLog(entry: ClientRequestLog): WeatherState {
+        return copy(requestLogs = (requestLogs + entry).takeLast(20))
+    }
+
     private fun statusForValues(temp: String?, hum: String?): SensorCardStatus =
         if (temp == null || hum == null) {
             SensorCardStatus.SensorUnavailable
@@ -1230,6 +1361,66 @@ internal enum class SensorDevice {
     External,
 }
 
+internal data class ClientRequestLog(
+    val device: SensorDevice,
+    val path: String,
+    val startedAtMillis: Long,
+    val finishedAtMillis: Long,
+    val elapsedMillis: Long,
+    val attempts: List<ClientRequestAttempt>,
+    val result: String,
+)
+
+internal data class ClientRequestAttempt(
+    val host: String,
+    val status: String,
+    val elapsedMillis: Long,
+)
+
+internal class RequestTimingTrace {
+    private val attempts = mutableListOf<ClientRequestAttempt>()
+
+    @Synchronized
+    fun add(attempt: ClientRequestAttempt) {
+        attempts += attempt
+    }
+
+    @Synchronized
+    fun snapshot(): List<ClientRequestAttempt> = attempts.toList()
+}
+
+private class RequestTimingNetworkInterceptor : Interceptor {
+    override fun intercept(chain: Interceptor.Chain): okhttp3.Response {
+        val request = chain.request()
+        val trace = request.tag(RequestTimingTrace::class.java)
+        val startedAtNanos = SystemClock.elapsedRealtimeNanos()
+        try {
+            val response = chain.proceed(request)
+            trace?.add(
+                ClientRequestAttempt(
+                    host = request.url.toString().hostLabel(),
+                    status = "HTTP ${response.code}",
+                    elapsedMillis = elapsedMillisSince(startedAtNanos),
+                )
+            )
+            return response
+        } catch (error: IOException) {
+            trace?.add(
+                ClientRequestAttempt(
+                    host = request.url.toString().hostLabel(),
+                    status = error.javaClass.simpleName,
+                    elapsedMillis = elapsedMillisSince(startedAtNanos),
+                )
+            )
+            throw error
+        }
+    }
+}
+
+private fun elapsedMillisSince(startedAtNanos: Long): Long {
+    return (SystemClock.elapsedRealtimeNanos() - startedAtNanos) / 1_000_000
+}
+
 private data class AppRelease(
     val versionName: String,
     val versionCode: Int,
@@ -1253,6 +1444,12 @@ private sealed interface WeatherResult {
         val clearData: Boolean = false,
         val warning: Boolean = false,
     ) : WeatherResult
+}
+
+private fun WeatherResult.logLabel(): String = when (this) {
+    is WeatherResult.Success -> "получен ответ: OK"
+    WeatherResult.Unauthorized -> "получен ответ: HTTP 401"
+    is WeatherResult.Failure -> message?.let { "ошибка: $it" } ?: "ошибка соединения"
 }
 
 private sealed interface FetchResponse {
