@@ -31,7 +31,7 @@ internal class RetryInterceptor(
     private val primaryBaseUrl: HttpUrl,
     private val fallbackBaseUrl: HttpUrl?,
     private val tokenProvider: (HttpUrl) -> String?,
-    private val retryDelaysMs: List<Long> = listOf(500L, 1_000L, 3_000L),
+    private val retryDelaysMs: List<Long> = listOf(500L, 1_000L, 1_000L),
     private val primaryProbeIntervalMs: Long = 30_000L,
 ) : Interceptor {
     private val availabilityTracker = BackendAvailabilityTracker()
@@ -54,6 +54,7 @@ internal class RetryInterceptor(
                     lastPrimaryProbeAtMs = now
                     listOf(primaryBaseUrl, fallbackBaseUrl)
                 }
+                fallbackBaseUrl != null -> listOf(activeBaseUrl, primaryBaseUrl).distinct()
                 else -> listOf(activeBaseUrl)
             }
         }
@@ -78,6 +79,11 @@ internal class RetryInterceptor(
             for (attempt in 0..retryDelaysMs.size) {
                 try {
                     val response = chain.proceed(routedRequest)
+                    if (response.code == 401 && candidateIndex < candidates.lastIndex) {
+                        response.close()
+                        Log.w(TAG, "Backend ${baseUrl.redact()} rejected its token; trying alternate backend")
+                        break
+                    }
                     if (response.code !in 500..599) {
                         markAvailable(requestId, baseUrl, trackAvailability)
                         return response

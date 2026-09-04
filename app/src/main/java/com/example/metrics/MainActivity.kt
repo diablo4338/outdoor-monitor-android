@@ -7,9 +7,14 @@ import android.content.Intent
 import android.os.Bundle
 import android.os.SystemClock
 import androidx.activity.ComponentActivity
-import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
-import androidx.activity.result.contract.ActivityResultContracts
+import androidx.credentials.ClearCredentialStateRequest
+import androidx.credentials.CredentialOption
+import androidx.credentials.CredentialManager
+import androidx.credentials.CustomCredential
+import androidx.credentials.GetCredentialRequest
+import androidx.credentials.exceptions.GetCredentialException
+import androidx.credentials.exceptions.NoCredentialException
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -61,11 +66,8 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.google.android.gms.auth.api.signin.GoogleSignIn
-import com.google.android.gms.auth.api.signin.GoogleSignInClient
-import com.google.android.gms.auth.api.signin.GoogleSignInOptions
-import com.google.android.gms.common.api.ApiException
-import com.google.android.gms.tasks.Tasks
+import com.google.android.libraries.identity.googleid.GetSignInWithGoogleOption
+import com.google.android.libraries.identity.googleid.GoogleIdTokenCredential
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
@@ -75,8 +77,6 @@ import androidx.core.net.toUri
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
@@ -97,9 +97,7 @@ import java.text.SimpleDateFormat
 import java.util.Calendar
 import java.util.Date
 import java.util.Locale
-import java.util.concurrent.ExecutionException
 import java.util.concurrent.TimeUnit
-import java.util.concurrent.TimeoutException
 import java.util.concurrent.ConcurrentHashMap
 import javax.net.ssl.SSLException
 import kotlin.time.Duration.Companion.seconds
@@ -133,6 +131,7 @@ private val backendBaseUrls = listOfNotNull(
     BuildConfig.API_FALLBACK_BASE_URL.takeIf { it.isNotBlank() }?.toHttpUrl(),
 ).distinctBy { it.origin() }
 private val domainTokens = ConcurrentHashMap<String, String>()
+private val clientRequestSequence = java.util.concurrent.atomic.AtomicLong()
 private val retryInterceptor = RetryInterceptor(
     primaryBaseUrl = backendBaseUrls.first(),
     fallbackBaseUrl = backendBaseUrls.getOrNull(1),
@@ -140,7 +139,7 @@ private val retryInterceptor = RetryInterceptor(
 )
 
 private val httpClient = OkHttpClient.Builder()
-    .connectTimeout(5, TimeUnit.SECONDS)
+    .connectTimeout(300, TimeUnit.MILLISECONDS)
     .readTimeout(5, TimeUnit.SECONDS)
     .addInterceptor(retryInterceptor)
     .addNetworkInterceptor(RequestTimingNetworkInterceptor())
@@ -213,13 +212,6 @@ private fun saveAuthSession(context: Context, tokens: Map<String, String>, provi
         }
 }
 
-private fun getStoredAuthProvider(context: Context): String? {
-    return context
-        .getSharedPreferences(AUTH_PREFS, Context.MODE_PRIVATE)
-        .getString(AUTH_PROVIDER_KEY, null)
-        ?.takeIf { it.isNotBlank() }
-}
-
 private fun clearAuthSession(context: Context) {
     domainTokens.clear()
     context
@@ -244,15 +236,12 @@ private fun MetricsApp(weatherViewModel: WeatherViewModel) {
     var latestRelease by remember { mutableStateOf<AppRelease?>(null) }
     var showVersionDialog by remember { mutableStateOf(false) }
     var tokenRevision by remember { mutableStateOf(0L) }
-    val tokenRefreshMutex = remember { Mutex() }
     val snackbarHostState = remember { SnackbarHostState() }
     val availableUpdate = latestRelease?.takeIf { it.versionCode > BuildConfig.VERSION_CODE }
 
     suspend fun load(
         device: SensorDevice,
         jwtForRequest: String? = jwt,
-        allowGoogleRefresh: Boolean = true,
-        requestTokenRevision: Long = tokenRevision,
     ) {
         if (jwtForRequest.isNullOrBlank()) {
             weatherViewModel.reset()
@@ -260,8 +249,23 @@ private fun MetricsApp(weatherViewModel: WeatherViewModel) {
         }
         weatherViewModel.update { it.withLoading(device, true) }
         val requestTrace = RequestTimingTrace()
+        val requestId = clientRequestSequence.incrementAndGet()
         val requestStartedAtMillis = System.currentTimeMillis()
         val requestStartedAtNanos = SystemClock.elapsedRealtimeNanos()
+        weatherViewModel.update {
+            it.withRequestLog(
+                ClientRequestLog(
+                    requestId = requestId,
+                    device = device,
+                    path = if (device == SensorDevice.Primary) {
+                        PRIMARY_WEATHER_PATH
+                    } else {
+                        EXTERNAL_WEATHER_PATH
+                    },
+                    startedAtMillis = requestStartedAtMillis,
+                )
+            )
+        }
         val result = loadWeather(jwtForRequest, device, requestTrace)
         val requestElapsedMillis =
             (SystemClock.elapsedRealtimeNanos() - requestStartedAtNanos) / 1_000_000
@@ -269,6 +273,7 @@ private fun MetricsApp(weatherViewModel: WeatherViewModel) {
         weatherViewModel.update {
             it.withRequestLog(
                 ClientRequestLog(
+                    requestId = requestId,
                     device = device,
                     path = if (device == SensorDevice.Primary) {
                         PRIMARY_WEATHER_PATH
@@ -288,29 +293,9 @@ private fun MetricsApp(weatherViewModel: WeatherViewModel) {
                 weatherViewModel.update { it.withSnapshot(device, result.snapshot) }
             }
             is WeatherResult.Unauthorized -> {
-                if (allowGoogleRefresh && getStoredAuthProvider(context) == AUTH_PROVIDER_GOOGLE) {
-                    val refreshedToken = tokenRefreshMutex.withLock {
-                        if (tokenRevision != requestTokenRevision) {
-                            jwt
-                        } else {
-                            refreshGoogleBackendToken(context).also {
-                                tokenRevision += 1
-                                jwt = it
-                            }
-                        }
-                    }
-                    if (refreshedToken != null) {
-                        load(
-                            device = device,
-                            jwtForRequest = refreshedToken,
-                            allowGoogleRefresh = false,
-                            requestTokenRevision = tokenRevision,
-                        )
-                        return
-                    }
-                }
                 clearAuthSession(context)
                 jwt = null
+                tokenRevision += 1
                 weatherViewModel.reset()
             }
             is WeatherResult.Failure -> {
@@ -703,13 +688,17 @@ private fun ClientRequestLogPanel(entries: List<ClientRequestLog>) {
                             append(attempt.elapsedMillis)
                             append(" мс")
                         }
-                        append("\n← ")
-                        append(formatClientLogTimestamp(entry.finishedAtMillis))
-                        append("  ")
-                        append(entry.result)
-                        append("  •  ")
-                        append(entry.elapsedMillis)
-                        append(" мс")
+                        if (entry.finishedAtMillis == null) {
+                            append("\n  выполняется…")
+                        } else {
+                            append("\n← ")
+                            append(formatClientLogTimestamp(entry.finishedAtMillis))
+                            append("  ")
+                            append(entry.result)
+                            append("  •  ")
+                            append(entry.elapsedMillis)
+                            append(" мс")
+                        }
                     },
                     color = Color(0xFFCCCCCC),
                     fontSize = 12.sp,
@@ -806,19 +795,7 @@ private fun LoginScreen(
     )
 
     val context = LocalContext.current
-    val googleClient = remember { buildGoogleSignInClient(context) }
-
-    val signInLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.StartActivityForResult()
-    ) { result ->
-        val token = readGoogleIdToken(result.data)
-        if (token == null) {
-            localError = "Не удалось выбрать Google аккаунт"
-            return@rememberLauncherForActivityResult
-        }
-        localError = null
-        onGoogleLogin(token)
-    }
+    val scope = rememberCoroutineScope()
 
     Column(
         modifier = Modifier
@@ -886,7 +863,19 @@ private fun LoginScreen(
                     return@Button
                 }
                 localError = null
-                signInLauncher.launch(googleClient.signInIntent)
+                scope.launch {
+                    val token = requestGoogleIdToken(
+                        context = context,
+                        option = GetSignInWithGoogleOption.Builder(
+                            BuildConfig.GOOGLE_WEB_CLIENT_ID
+                        ).build(),
+                    )
+                    if (token == null) {
+                        localError = "Не удалось выбрать Google аккаунт"
+                    } else {
+                        onGoogleLogin(token)
+                    }
+                }
             },
             enabled = true,
             colors = buttonColors,
@@ -1157,62 +1146,37 @@ private suspend fun logout(tokens: Map<String, String>) {
     }
 }
 
-private fun buildGoogleSignInClient(context: Context): GoogleSignInClient {
-    val optionsBuilder = GoogleSignInOptions.Builder(GoogleSignInOptions.DEFAULT_SIGN_IN)
-        .requestEmail()
-    if (BuildConfig.GOOGLE_WEB_CLIENT_ID.isNotBlank()) {
-        optionsBuilder.requestIdToken(BuildConfig.GOOGLE_WEB_CLIENT_ID)
-    }
-    return GoogleSignIn.getClient(context, optionsBuilder.build())
-}
-
 private suspend fun signOutGoogle(context: Context) {
-    withContext(Dispatchers.IO) {
-        try {
-            Tasks.await(buildGoogleSignInClient(context).signOut(), 5, TimeUnit.SECONDS)
-        } catch (_: ExecutionException) {
-        } catch (_: InterruptedException) {
-            Thread.currentThread().interrupt()
-        } catch (_: TimeoutException) {
-        }
+    runCatching {
+        CredentialManager.create(context)
+            .clearCredentialState(ClearCredentialStateRequest())
     }
 }
 
-private suspend fun refreshGoogleBackendToken(context: Context): String? {
-    return withContext(Dispatchers.IO) {
-        try {
-            val account = Tasks.await(
-                buildGoogleSignInClient(context).silentSignIn(),
-                5,
-                TimeUnit.SECONDS,
-            )
-            val idToken = account.idToken?.takeIf { it.isNotBlank() } ?: return@withContext null
-            when (val result = loginWithGoogle(idToken)) {
-                is AuthResult.Success -> {
-                    saveAuthSession(context, result.tokens, AUTH_PROVIDER_GOOGLE)
-                    result.tokens.values.first()
-                }
-                AuthResult.InvalidCredentials,
-                is AuthResult.Failure -> null
-            }
-        } catch (_: ExecutionException) {
-            null
-        } catch (_: InterruptedException) {
-            Thread.currentThread().interrupt()
-            null
-        } catch (_: TimeoutException) {
-            null
-        }
-    }
-}
-
-private fun readGoogleIdToken(data: Intent?): String? {
+private suspend fun requestGoogleIdToken(
+    context: Context,
+    option: CredentialOption,
+): String? {
     return try {
-        GoogleSignIn.getSignedInAccountFromIntent(data)
-            .getResult(ApiException::class.java)
-            .idToken
-            ?.takeIf { it.isNotBlank() }
-    } catch (_: ApiException) {
+        val request = GetCredentialRequest.Builder()
+            .addCredentialOption(option)
+            .build()
+        val credential = CredentialManager.create(context)
+            .getCredential(context, request)
+            .credential
+        if (
+            credential is CustomCredential &&
+            credential.type == GoogleIdTokenCredential.TYPE_GOOGLE_ID_TOKEN_CREDENTIAL
+        ) {
+            GoogleIdTokenCredential.createFrom(credential.data).idToken
+        } else {
+            null
+        }
+    } catch (_: NoCredentialException) {
+        null
+    } catch (_: GetCredentialException) {
+        null
+    } catch (_: IllegalArgumentException) {
         null
     }
 }
@@ -1330,7 +1294,13 @@ internal data class WeatherState(
     }
 
     fun withRequestLog(entry: ClientRequestLog): WeatherState {
-        return copy(requestLogs = (requestLogs + entry).takeLast(20))
+        val existingIndex = requestLogs.indexOfFirst { it.requestId == entry.requestId }
+        val updatedLogs = if (existingIndex < 0) {
+            requestLogs + entry
+        } else {
+            requestLogs.toMutableList().apply { this[existingIndex] = entry }
+        }
+        return copy(requestLogs = updatedLogs.takeLast(20))
     }
 
     private fun statusForValues(temp: String?, hum: String?): SensorCardStatus =
@@ -1362,13 +1332,14 @@ internal enum class SensorDevice {
 }
 
 internal data class ClientRequestLog(
+    val requestId: Long,
     val device: SensorDevice,
     val path: String,
     val startedAtMillis: Long,
-    val finishedAtMillis: Long,
-    val elapsedMillis: Long,
-    val attempts: List<ClientRequestAttempt>,
-    val result: String,
+    val finishedAtMillis: Long? = null,
+    val elapsedMillis: Long = 0,
+    val attempts: List<ClientRequestAttempt> = emptyList(),
+    val result: String = "выполняется",
 )
 
 internal data class ClientRequestAttempt(
