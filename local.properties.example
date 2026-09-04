@@ -1,4 +1,4 @@
-DEBUG_API_BASE_URL=http://your-backend-host:8000
+DEBUG_API_BASE_URL=http://10.0.2.2:8000
 DEBUG_API_FALLBACK_BASE_URL=
 RELEASE_API_BASE_URL=https://your-domain
 RELEASE_API_FALLBACK_BASE_URL=https://your-fallback-domain
