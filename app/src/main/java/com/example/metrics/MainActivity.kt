@@ -72,20 +72,12 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.repeatOnLifecycle
-import androidx.core.content.edit
 import androidx.core.net.toUri
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
-import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
-import okhttp3.HttpUrl.Companion.toHttpUrl
-import okhttp3.Interceptor
-import okhttp3.MediaType.Companion.toMediaType
-import okhttp3.OkHttpClient
-import okhttp3.Request
-import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONException
 import org.json.JSONObject
 import java.io.IOException
@@ -97,14 +89,13 @@ import java.text.SimpleDateFormat
 import java.util.Calendar
 import java.util.Date
 import java.util.Locale
-import java.util.concurrent.TimeUnit
-import java.util.concurrent.ConcurrentHashMap
 import javax.net.ssl.SSLException
 import kotlin.time.Duration.Companion.seconds
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        backend = BackendMiddleware.getInstance(applicationContext)
         val weatherViewModel = ViewModelProvider(this)[WeatherViewModel::class.java]
         setContent {
             MetricsApp(weatherViewModel)
@@ -112,49 +103,18 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-private const val AUTH_PREFS = "weather_auth"
-private const val LEGACY_JWT_KEY = "backend_jwt"
-private const val JWT_KEY_PREFIX = "backend_jwt:"
-private const val AUTH_PROVIDER_KEY = "auth_provider"
-private const val AUTH_PROVIDER_GOOGLE = "google"
-private const val AUTH_PROVIDER_PASSWORD = "password"
 private const val PRIMARY_WEATHER_PATH = "/api/v1/weather/primary/latest"
 private const val EXTERNAL_WEATHER_PATH = "/api/v1/weather/external/latest"
 private const val APP_LATEST_PATH = "/api/v1/app/latest"
 private const val GOOGLE_AUTH_PATH = "/auth/google"
 private const val PASSWORD_AUTH_PATH = "/auth/password"
-private const val LOGOUT_PATH = "/auth/logout"
 
-private val jsonMediaType = "application/json; charset=utf-8".toMediaType()
-private val backendBaseUrls = listOfNotNull(
-    BuildConfig.API_BASE_URL.toHttpUrl(),
-    BuildConfig.API_FALLBACK_BASE_URL.takeIf { it.isNotBlank() }?.toHttpUrl(),
-).distinctBy { it.origin() }
-private val domainTokens = ConcurrentHashMap<String, String>()
+private lateinit var backend: BackendMiddleware
 private val clientRequestSequence = java.util.concurrent.atomic.AtomicLong()
-private val retryInterceptor = RetryInterceptor(
-    primaryBaseUrl = backendBaseUrls.first(),
-    fallbackBaseUrl = backendBaseUrls.getOrNull(1),
-    tokenProvider = { domainTokens[it.origin()] },
-)
-
-private val httpClient = OkHttpClient.Builder()
-    .connectTimeout(300, TimeUnit.MILLISECONDS)
-    .readTimeout(5, TimeUnit.SECONDS)
-    .addInterceptor(retryInterceptor)
-    .addNetworkInterceptor(RequestTimingNetworkInterceptor())
-    .build()
-
-private fun apiUrl(path: String): String = BuildConfig.API_BASE_URL.trimEnd('/') + path
 
 private suspend fun loadLatestRelease(): AppRelease? = withContext(Dispatchers.IO) {
     try {
-        val request = Request.Builder()
-            .url(apiUrl(APP_LATEST_PATH))
-            .tag(IgnoreBackendAvailability::class.java, IgnoreBackendAvailability)
-            .get()
-            .build()
-        httpClient.newCall(request).execute().use { response ->
+        backend.request(APP_LATEST_PATH, authenticated = false, trackAvailability = false).use { response ->
             if (!response.isSuccessful) return@withContext null
             val body = response.body.string()
             val json = JSONObject(body)
@@ -180,70 +140,25 @@ private fun openDownload(context: Context, downloadUrl: String) {
     runCatching { context.startActivity(intent) }
 }
 
-private fun getStoredJwt(context: Context): String? {
-    val preferences = context.getSharedPreferences(AUTH_PREFS, Context.MODE_PRIVATE)
-    backendBaseUrls.forEach { baseUrl ->
-        preferences.getString(JWT_KEY_PREFIX + baseUrl.origin(), null)
-            ?.takeIf { it.isNotBlank() }
-            ?.let { domainTokens[baseUrl.origin()] = it }
-    }
-    if (domainTokens.isEmpty()) {
-        preferences.getString(LEGACY_JWT_KEY, null)
-            ?.takeIf { it.isNotBlank() }
-            ?.let { legacyToken ->
-                val primaryOrigin = backendBaseUrls.first().origin()
-                domainTokens[primaryOrigin] = legacyToken
-                preferences.edit {
-                    putString(JWT_KEY_PREFIX + primaryOrigin, legacyToken)
-                    remove(LEGACY_JWT_KEY)
-                }
-            }
-    }
-    return domainTokens.values.firstOrNull()
-}
-
-private fun saveAuthSession(context: Context, tokens: Map<String, String>, provider: String) {
-    domainTokens.putAll(tokens)
-    context
-        .getSharedPreferences(AUTH_PREFS, Context.MODE_PRIVATE)
-        .edit {
-            tokens.forEach { (origin, token) -> putString(JWT_KEY_PREFIX + origin, token) }
-            putString(AUTH_PROVIDER_KEY, provider)
-        }
-}
-
-private fun clearAuthSession(context: Context) {
-    domainTokens.clear()
-    context
-        .getSharedPreferences(AUTH_PREFS, Context.MODE_PRIVATE)
-        .edit {
-            backendBaseUrls.forEach { remove(JWT_KEY_PREFIX + it.origin()) }
-            remove(LEGACY_JWT_KEY)
-            remove(AUTH_PROVIDER_KEY)
-        }
-}
-
 @Composable
 private fun MetricsApp(weatherViewModel: WeatherViewModel) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val lifecycle = (context as ComponentActivity).lifecycle
-    val allBackendsUnavailable by retryInterceptor.allBackendsUnavailable.collectAsState()
-    var jwt by remember(context) { mutableStateOf(getStoredJwt(context)) }
+    val allBackendsUnavailable by backend.allBackendsUnavailable.collectAsState()
+    var signedIn by remember { mutableStateOf(backend.hasStoredToken()) }
     val weatherState = weatherViewModel.state
     var activeDevice by remember { mutableStateOf(SensorDevice.Primary) }
     var showRequestLog by remember { mutableStateOf(false) }
     var latestRelease by remember { mutableStateOf<AppRelease?>(null) }
     var showVersionDialog by remember { mutableStateOf(false) }
-    var tokenRevision by remember { mutableStateOf(0L) }
     val snackbarHostState = remember { SnackbarHostState() }
     val availableUpdate = latestRelease?.takeIf { it.versionCode > BuildConfig.VERSION_CODE }
 
     suspend fun load(
         device: SensorDevice,
-        jwtForRequest: String? = jwt,
     ) {
-        if (jwtForRequest.isNullOrBlank()) {
+        if (!signedIn) {
             weatherViewModel.reset()
             return
         }
@@ -266,7 +181,7 @@ private fun MetricsApp(weatherViewModel: WeatherViewModel) {
                 )
             )
         }
-        val result = loadWeather(jwtForRequest, device, requestTrace)
+        val result = loadWeather(device, requestTrace)
         val requestElapsedMillis =
             (SystemClock.elapsedRealtimeNanos() - requestStartedAtNanos) / 1_000_000
         val requestFinishedAtMillis = System.currentTimeMillis()
@@ -293,9 +208,7 @@ private fun MetricsApp(weatherViewModel: WeatherViewModel) {
                 weatherViewModel.update { it.withSnapshot(device, result.snapshot) }
             }
             is WeatherResult.Unauthorized -> {
-                clearAuthSession(context)
-                jwt = null
-                tokenRevision += 1
+                signedIn = false
                 weatherViewModel.reset()
             }
             is WeatherResult.Failure -> {
@@ -311,16 +224,13 @@ private fun MetricsApp(weatherViewModel: WeatherViewModel) {
         }
     }
 
-    LaunchedEffect(jwt, lifecycle, activeDevice) {
-        val pollingJwt = jwt?.takeIf { it.isNotBlank() } ?: return@LaunchedEffect
+    LaunchedEffect(signedIn, lifecycle, activeDevice) {
+        if (!signedIn) return@LaunchedEffect
         lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
-            val currentStatus = weatherViewModel.state.cardFor(activeDevice).status
-            if (currentStatus != SensorCardStatus.Loading) {
-                load(activeDevice, pollingJwt)
-            }
+            load(activeDevice)
             while (true) {
                 delay(BuildConfig.POLL_INTERVAL_SECONDS.seconds)
-                load(activeDevice, pollingJwt)
+                load(activeDevice)
             }
         }
     }
@@ -352,7 +262,7 @@ private fun MetricsApp(weatherViewModel: WeatherViewModel) {
                 .fillMaxSize()
                 .padding(contentPadding),
         ) {
-    if (jwt.isNullOrBlank()) {
+    if (!signedIn) {
         LoginScreen(
             onPasswordLogin = { username, password ->
                 scope.launch {
@@ -366,11 +276,9 @@ private fun MetricsApp(weatherViewModel: WeatherViewModel) {
                             weatherViewModel.reset(WeatherState(error = result.message))
                             return@launch
                         }
-                        is AuthResult.Success -> {
-                            saveAuthSession(context, result.tokens, AUTH_PROVIDER_PASSWORD)
+                        AuthResult.Success -> {
                             weatherViewModel.reset()
-                            jwt = result.tokens.values.first()
-                            tokenRevision += 1
+                            signedIn = true
                         }
                     }
                 }
@@ -379,23 +287,17 @@ private fun MetricsApp(weatherViewModel: WeatherViewModel) {
                 scope.launch {
                     weatherViewModel.reset(WeatherState(loading = true))
                     when (val result = loginWithGoogle(idToken)) {
-                        is AuthResult.Success -> {
-                            saveAuthSession(context, result.tokens, AUTH_PROVIDER_GOOGLE)
+                        AuthResult.Success -> {
                             weatherViewModel.reset()
-                            jwt = result.tokens.values.first()
-                            tokenRevision += 1
+                            signedIn = true
                         }
                         AuthResult.InvalidCredentials -> {
                             signOutGoogle(context)
-                            clearAuthSession(context)
-                            jwt = null
                             weatherViewModel.reset(WeatherState(error = "Google token отклонен backend"))
                             return@launch
                         }
                         is AuthResult.Failure -> {
                             signOutGoogle(context)
-                            clearAuthSession(context)
-                            jwt = null
                             weatherViewModel.reset(WeatherState(error = result.message))
                             return@launch
                         }
@@ -414,7 +316,7 @@ private fun MetricsApp(weatherViewModel: WeatherViewModel) {
         )
     }
 
-            if (!jwt.isNullOrBlank()) {
+            if (signedIn) {
                 Row(
                     modifier = Modifier
                         .align(Alignment.TopStart)
@@ -445,16 +347,18 @@ private fun MetricsApp(weatherViewModel: WeatherViewModel) {
                         fontSize = 28.sp,
                     )
                 }
-                if (!jwt.isNullOrBlank()) {
+                if (signedIn) {
                     IconButton(
                         onClick = {
-                            val tokensForLogout = domainTokens.toMap()
-                            clearAuthSession(context)
-                            jwt = null
-                            tokenRevision += 1
-                            weatherViewModel.reset()
                             scope.launch {
-                                logout(tokensForLogout)
+                                try {
+                                    backend.request("/auth/logout", body = "", trackAvailability = false).close()
+                                } catch (_: IOException) {
+                                } finally {
+                                    backend.clearSession()
+                                    signedIn = false
+                                    weatherViewModel.reset()
+                                }
                                 signOutGoogle(context)
                             }
                         },
@@ -772,6 +676,8 @@ private fun LoginScreen(
     var username by remember { mutableStateOf("") }
     var password by remember { mutableStateOf("") }
     var localError by remember { mutableStateOf<String?>(null) }
+    var choosingGoogleAccount by remember { mutableStateOf(false) }
+    val busy = loading || choosingGoogleAccount
     val fieldColors = TextFieldDefaults.colors(
         focusedTextColor = Color(0xFFEEEEEE),
         unfocusedTextColor = Color(0xFFEEEEEE),
@@ -839,11 +745,11 @@ private fun LoginScreen(
 
             Button(
                 onClick = {
-                    if (loading) return@Button
+                    if (busy) return@Button
                     localError = null
                     onPasswordLogin(username.trim(), password)
                 },
-                enabled = username.isNotBlank() && password.isNotBlank(),
+                enabled = !busy && username.isNotBlank() && password.isNotBlank(),
                 colors = buttonColors,
                 modifier = Modifier
                     .fillMaxWidth()
@@ -857,27 +763,32 @@ private fun LoginScreen(
 
         Button(
             onClick = {
-                if (loading) return@Button
+                if (busy) return@Button
                 if (BuildConfig.GOOGLE_WEB_CLIENT_ID.isBlank()) {
                     localError = "Google OAuth client id не настроен"
                     return@Button
                 }
                 localError = null
+                choosingGoogleAccount = true
                 scope.launch {
-                    val token = requestGoogleIdToken(
-                        context = context,
-                        option = GetSignInWithGoogleOption.Builder(
-                            BuildConfig.GOOGLE_WEB_CLIENT_ID
-                        ).build(),
-                    )
-                    if (token == null) {
-                        localError = "Не удалось выбрать Google аккаунт"
-                    } else {
-                        onGoogleLogin(token)
+                    try {
+                        val token = requestGoogleIdToken(
+                            context = context,
+                            option = GetSignInWithGoogleOption.Builder(
+                                BuildConfig.GOOGLE_WEB_CLIENT_ID
+                            ).build(),
+                        )
+                        if (token == null) {
+                            localError = "Не удалось выбрать Google аккаунт"
+                        } else {
+                            onGoogleLogin(token)
+                        }
+                    } finally {
+                        choosingGoogleAccount = false
                     }
                 }
             },
-            enabled = true,
+            enabled = !busy,
             colors = buttonColors,
             modifier = Modifier
                 .fillMaxWidth()
@@ -899,7 +810,9 @@ private fun LoginScreen(
                 .height(64.dp),
             contentAlignment = Alignment.Center,
         ) {
-            ErrorText(
+            if (busy) {
+                CircularProgressIndicator(color = Color(0xFFEEEEEE))
+            } else ErrorText(
                 text = message ?: " ",
                 modifier = Modifier.alpha(messageAlpha),
             )
@@ -923,11 +836,10 @@ private fun ErrorText(
 }
 
 private suspend fun loadWeather(
-    jwt: String?,
     device: SensorDevice,
     requestTrace: RequestTimingTrace,
 ): WeatherResult {
-    return when (val response = fetchWeatherMetrics(jwt, device, requestTrace)) {
+    return when (val response = fetchWeatherMetrics(device, requestTrace)) {
         FetchResponse.Unauthorized -> WeatherResult.Unauthorized
         is FetchResponse.Failure -> response.toWeatherFailure()
         is FetchResponse.Success -> {
@@ -991,25 +903,13 @@ private fun formatClientLogTimestamp(epochMillis: Long): String {
 }
 
 private suspend fun fetchWeatherMetrics(
-    jwt: String?,
     device: SensorDevice,
     requestTrace: RequestTimingTrace,
 ): FetchResponse {
     return withContext(Dispatchers.IO) {
-        val requestUrl = apiUrl(
-            if (device == SensorDevice.Primary) PRIMARY_WEATHER_PATH else EXTERNAL_WEATHER_PATH
-        )
+        val route = if (device == SensorDevice.Primary) PRIMARY_WEATHER_PATH else EXTERNAL_WEATHER_PATH
         try {
-            val requestBuilder = Request.Builder()
-                .url(requestUrl)
-                .get()
-                .tag(RequestTimingTrace::class.java, requestTrace)
-
-            if (!jwt.isNullOrBlank()) {
-                requestBuilder.header("Authorization", "Bearer routed-by-interceptor")
-            }
-
-            httpClient.newCall(requestBuilder.build()).execute().use { response ->
+            backend.request(route, trace = requestTrace).use { response ->
                 when {
                     response.code == 401 -> FetchResponse.Unauthorized
                     !response.isSuccessful -> {
@@ -1047,13 +947,13 @@ private suspend fun fetchWeatherMetrics(
                 }
             }
         } catch (_: UnknownHostException) {
-            FetchResponse.Failure.UnknownHost(requestUrl.hostLabel())
+            FetchResponse.Failure.UnknownHost(requestTrace.snapshot().lastOrNull()?.host ?: "backend")
         } catch (_: SocketTimeoutException) {
             FetchResponse.Failure.Timeout
         } catch (_: ConnectException) {
-            FetchResponse.Failure.BackendUnavailable(requestUrl.hostLabel())
+            FetchResponse.Failure.BackendUnavailable(requestTrace.snapshot().lastOrNull()?.host ?: "backend")
         } catch (_: NoRouteToHostException) {
-            FetchResponse.Failure.BackendUnavailable(requestUrl.hostLabel())
+            FetchResponse.Failure.BackendUnavailable(requestTrace.snapshot().lastOrNull()?.host ?: "backend")
         } catch (_: SSLException) {
             FetchResponse.Failure.Tls
         } catch (_: IOException) {
@@ -1063,87 +963,48 @@ private suspend fun fetchWeatherMetrics(
 }
 
 private suspend fun loginWithGoogle(idToken: String): AuthResult {
-    val payload = JSONObject()
-        .put("id_token", idToken)
-        .toString()
-    return exchangeToken(GOOGLE_AUTH_PATH, payload)
+    return exchangeToken(GOOGLE_AUTH_PATH, JSONObject().put("id_token", idToken).toString())
 }
 
 private suspend fun loginWithPassword(username: String, password: String): AuthResult {
-    val payload = JSONObject()
-        .put("username", username)
-        .put("password", password)
-        .toString()
-    return exchangeToken(PASSWORD_AUTH_PATH, payload)
+    return exchangeToken(
+        PASSWORD_AUTH_PATH,
+        JSONObject().put("username", username).put("password", password).toString(),
+    )
 }
 
-private suspend fun exchangeToken(path: String, payload: String): AuthResult {
-    return withContext(Dispatchers.IO) {
-        val tokens = mutableMapOf<String, String>()
-        var invalidCredentials = false
-        var visibleFailure: String? = null
-        backendBaseUrls.forEach { baseUrl ->
-            try {
-                val request = Request.Builder()
-                    .url(baseUrl.resolve(path)!!)
-                    .tag(PinnedBackend::class.java, PinnedBackend(baseUrl))
-                    .tag(IgnoreBackendAvailability::class.java, IgnoreBackendAvailability)
-                    .post(payload.toRequestBody(jsonMediaType))
-                    .build()
-
-                httpClient.newCall(request).execute().use { response ->
-                    when {
-                        response.code == 401 || response.code == 403 -> invalidCredentials = true
-                        response.code in 500..599 -> Unit
-                        !response.isSuccessful -> visibleFailure = "Backend вернул HTTP ${response.code} при входе"
-                        else -> {
-                            val text = response.body.string()
-                            val token = if (text.isBlank()) null else try {
-                                JSONObject(text).optString("access_token").takeIf { it.isNotBlank() }
-                            } catch (_: JSONException) {
-                                null
-                            }
-                            if (token == null) {
-                                visibleFailure = "Структура ответа backend несовместима с текущим клиентом"
-                            } else {
-                                tokens[response.request.url.origin()] = token
-                            }
-                        }
+private suspend fun exchangeToken(route: String, payload: String): AuthResult = withContext(Dispatchers.IO) {
+    try {
+        backend.request(route, payload, authenticated = false, trackAvailability = false).use { response ->
+            when {
+                response.code == 401 || response.code == 403 -> AuthResult.InvalidCredentials
+                !response.isSuccessful -> AuthResult.Failure("Backend вернул HTTP ${response.code} при входе")
+                else -> {
+                    val token = try {
+                        JSONObject(response.body.string()).optString("access_token").takeIf { it.isNotBlank() }
+                    } catch (_: JSONException) {
+                        null
+                    }
+                    if (token == null) {
+                        AuthResult.Failure("Структура ответа backend несовместима с текущим клиентом")
+                    } else {
+                        backend.saveToken(response, token)
+                        AuthResult.Success
                     }
                 }
-            } catch (_: SSLException) {
-                visibleFailure = "TLS/SSL ошибка при подключении к backend"
-            } catch (_: IOException) {
             }
         }
-        when {
-            tokens.isNotEmpty() -> AuthResult.Success(tokens)
-            invalidCredentials -> AuthResult.InvalidCredentials
-            else -> AuthResult.Failure(visibleFailure)
-        }
+    } catch (_: SSLException) {
+        AuthResult.Failure("TLS/SSL ошибка при подключении к backend")
+    } catch (_: IOException) {
+        AuthResult.Failure(null)
     }
 }
 
-private suspend fun logout(tokens: Map<String, String>) {
-    withContext(Dispatchers.IO) {
-        backendBaseUrls.filter { tokens.containsKey(it.origin()) }.forEach { baseUrl ->
-            try {
-                val request = Request.Builder()
-                    .url(baseUrl.resolve(LOGOUT_PATH)!!)
-                    .tag(PinnedBackend::class.java, PinnedBackend(baseUrl))
-                    .tag(IgnoreBackendAvailability::class.java, IgnoreBackendAvailability)
-                    .tag(
-                        RoutedAuthorization::class.java,
-                        RoutedAuthorization(tokens.getValue(baseUrl.origin())),
-                    )
-                    .post(ByteArray(0).toRequestBody())
-                    .header("Authorization", "Bearer routed-by-interceptor")
-                    .build()
-                httpClient.newCall(request).execute().close()
-            } catch (_: IOException) {
-            }
-        }
-    }
+private sealed interface AuthResult {
+    data object Success : AuthResult
+    data object InvalidCredentials : AuthResult
+    data class Failure(val message: String?) : AuthResult
 }
 
 private suspend fun signOutGoogle(context: Context) {
@@ -1203,14 +1064,6 @@ private fun FetchResponse.Failure.toWeatherFailure(): WeatherResult.Failure {
             if (code in 500..599) null else "Backend вернул HTTP $code"
         )
     }
-}
-
-private fun String.hostLabel(): String {
-    return toHttpUrlOrNull()?.let { url ->
-        val defaultPort = (url.scheme == "http" && url.port == 80) ||
-            (url.scheme == "https" && url.port == 443)
-        if (defaultPort) url.host else "${url.host}:${url.port}"
-    } ?: BuildConfig.API_BASE_URL
 }
 
 private fun formatMetricValue(value: Double): String {
@@ -1342,56 +1195,6 @@ internal data class ClientRequestLog(
     val result: String = "выполняется",
 )
 
-internal data class ClientRequestAttempt(
-    val host: String,
-    val status: String,
-    val elapsedMillis: Long,
-)
-
-internal class RequestTimingTrace {
-    private val attempts = mutableListOf<ClientRequestAttempt>()
-
-    @Synchronized
-    fun add(attempt: ClientRequestAttempt) {
-        attempts += attempt
-    }
-
-    @Synchronized
-    fun snapshot(): List<ClientRequestAttempt> = attempts.toList()
-}
-
-private class RequestTimingNetworkInterceptor : Interceptor {
-    override fun intercept(chain: Interceptor.Chain): okhttp3.Response {
-        val request = chain.request()
-        val trace = request.tag(RequestTimingTrace::class.java)
-        val startedAtNanos = SystemClock.elapsedRealtimeNanos()
-        try {
-            val response = chain.proceed(request)
-            trace?.add(
-                ClientRequestAttempt(
-                    host = request.url.toString().hostLabel(),
-                    status = "HTTP ${response.code}",
-                    elapsedMillis = elapsedMillisSince(startedAtNanos),
-                )
-            )
-            return response
-        } catch (error: IOException) {
-            trace?.add(
-                ClientRequestAttempt(
-                    host = request.url.toString().hostLabel(),
-                    status = error.javaClass.simpleName,
-                    elapsedMillis = elapsedMillisSince(startedAtNanos),
-                )
-            )
-            throw error
-        }
-    }
-}
-
-private fun elapsedMillisSince(startedAtNanos: Long): Long {
-    return (SystemClock.elapsedRealtimeNanos() - startedAtNanos) / 1_000_000
-}
-
 private data class AppRelease(
     val versionName: String,
     val versionCode: Int,
@@ -1438,11 +1241,3 @@ private sealed interface FetchResponse {
         data class UnknownHost(val host: String) : Failure
     }
 }
-
-private sealed interface AuthResult {
-    data class Success(val tokens: Map<String, String>) : AuthResult
-    data object InvalidCredentials : AuthResult
-    data class Failure(val message: String?) : AuthResult
-}
-
-private fun okhttp3.HttpUrl.origin(): String = "$scheme://$host:$port"
