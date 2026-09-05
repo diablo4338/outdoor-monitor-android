@@ -79,11 +79,8 @@ internal class RetryInterceptor(
             for (attempt in 0..retryDelaysMs.size) {
                 try {
                     val response = chain.proceed(routedRequest)
-                    if (response.code == 401 && candidateIndex < candidates.lastIndex) {
-                        response.close()
-                        Log.w(TAG, "Backend ${baseUrl.redact()} rejected its token; trying alternate backend")
-                        break
-                    }
+                    // Authentication failures must reach the UI immediately. An alternate
+                    // backend's outage must never hide a 401 and prevent sign-in.
                     if (response.code !in 500..599) {
                         markAvailable(requestId, baseUrl, trackAvailability)
                         return response
