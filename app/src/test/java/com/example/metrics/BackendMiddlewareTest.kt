@@ -4,6 +4,10 @@ import java.io.IOException
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import kotlinx.coroutines.async
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
@@ -15,12 +19,103 @@ import okhttp3.Response
 import okhttp3.ResponseBody.Companion.toResponseBody
 import org.junit.Assert.*
 import org.junit.Test
+import kotlin.time.Duration
 import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.seconds
 
 class BackendMiddlewareTest {
     private val primary = "https://primary.example/"
     private val fallback = "https://fallback.example/"
+
+    @Test
+    fun loadingTracksConcurrentRequestsAndCancellation() = runBlocking {
+        val started = CompletableDeferred<Unit>()
+        val count = AtomicInteger()
+        val releaseFirst = CountDownLatch(1)
+        val releaseSecond = CountDownLatch(1)
+        middleware { request ->
+            if (count.incrementAndGet() == 2) started.complete(Unit)
+            val release = if (request.url.encodedPath == "/first") releaseFirst else releaseSecond
+            check(release.await(3, TimeUnit.SECONDS))
+            response(request, 200)
+        }.use { backend ->
+            try {
+                val first = async { backend.request("/first").close() }
+                val second = async { backend.request("/second").close() }
+                withTimeout(2.seconds) { started.await() }
+                assertEquals(2, backend.state.value.activeRequests)
+                assertTrue(backend.state.value.showSpinner)
+                first.cancelAndJoin()
+                assertEquals(1, backend.state.value.activeRequests)
+                assertTrue(backend.state.value.isLoading)
+                releaseSecond.countDown()
+                second.await()
+                assertFalse(backend.state.value.showSpinner)
+                assertFalse(backend.state.value.allBackendsUnavailable)
+            } finally {
+                releaseFirst.countDown()
+                releaseSecond.countDown()
+            }
+        }
+    }
+
+    @Test
+    fun recoveryProbeClearsUnavailableStateWithoutForegroundRequest() = runBlocking {
+        middleware(probeIntervalMillis = 20) { request ->
+            response(request, if (request.url.encodedPath == "/health") 200 else 503)
+        }.use { backend ->
+            backend.request("/metrics").close()
+            assertFalse(backend.state.value.isLoading)
+            assertTrue(backend.state.value.allBackendsUnavailable)
+            assertTrue(backend.state.value.showSpinner)
+            withTimeout(2.seconds) {
+                while (backend.state.value.allBackendsUnavailable) delay(5.milliseconds)
+            }
+            assertFalse(backend.state.value.showSpinner)
+        }
+    }
+
+    @Test
+    fun switchesOnlyAfterAllRetriesAndReturns401Immediately() = runBlocking {
+        val calls = CopyOnWriteArrayList<String>()
+        middleware(retryDelays = List(3) { Duration.ZERO }) { request ->
+            calls += request.url.host
+            if (request.url.host == "primary.example") {
+                if (calls.size % 2 == 1) throw java.net.SocketTimeoutException("Timeout")
+                response(request, 503)
+            } else response(request, 401)
+        }.use { backend ->
+            backend.request("/metrics").use { assertEquals(401, it.code) }
+            assertEquals(List(4) { "primary.example" } + "fallback.example", calls)
+            assertFalse(backend.state.value.allBackendsUnavailable)
+        }
+    }
+
+    @Test
+    fun successfulRetryKeepsCurrentBackend() = runBlocking {
+        val calls = CopyOnWriteArrayList<String>()
+        middleware(retryDelays = List(3) { Duration.ZERO }) { request ->
+            calls += request.url.host
+            response(request, if (calls.size < 3) 503 else 200)
+        }.use { backend ->
+            backend.request("/metrics").close()
+            backend.request("/metrics").close()
+            assertEquals(List(4) { "primary.example" }, calls)
+        }
+    }
+
+    @Test
+    fun unavailableStateIsReportedAfterBothBackendsExhaustRetries() = runBlocking {
+        val calls = CopyOnWriteArrayList<String>()
+        middleware(retryDelays = List(3) { Duration.ZERO }) { request ->
+            calls += request.url.host
+            response(request, 503)
+        }.use { backend ->
+            backend.request("/metrics").use { assertEquals(503, it.code) }
+            assertEquals(List(4) { "primary.example" } + List(4) { "fallback.example" }, calls)
+            assertTrue(backend.state.value.allBackendsUnavailable)
+        }
+    }
 
     @Test
     fun routesRequestsAndUsesEachBackendsOwnToken() = runBlocking {
@@ -35,7 +130,7 @@ class BackendMiddlewareTest {
             backend.request("/metrics?limit=1").close()
             backend.request("/metrics?limit=1").close()
             assertEquals(listOf("primary.example", "fallback.example", "fallback.example"), calls)
-            assertFalse(backend.allBackendsUnavailable.value)
+            assertFalse(backend.state.value.allBackendsUnavailable)
         }
     }
 
@@ -101,7 +196,7 @@ class BackendMiddlewareTest {
             backend.request("/metrics").close()
             backend.request("/metrics").close()
             assertEquals(listOf("primary.example", "fallback.example", "fallback.example"), calls)
-            assertTrue(backend.allBackendsUnavailable.value)
+            assertTrue(backend.state.value.allBackendsUnavailable)
         }
     }
 
@@ -179,11 +274,13 @@ class BackendMiddlewareTest {
     private fun middleware(
         store: MemoryTokens = MemoryTokens(),
         probeIntervalMillis: Long = 10_000,
+        retryDelays: List<Duration> = emptyList(),
         respond: (Request) -> Response,
     ) = BackendMiddleware(
         primary, fallback, store,
         client = OkHttpClient.Builder().addInterceptor { respond(it.request()) }.build(),
         probeIntervalMillis = probeIntervalMillis,
+        retryDelays = retryDelays,
     )
 
     private class MemoryTokens(

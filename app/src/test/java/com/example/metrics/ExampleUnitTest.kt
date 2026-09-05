@@ -71,9 +71,9 @@ class WeatherStateTest {
         tracker.report(requestId = 2L, available = false)
         tracker.report(requestId = 1L, available = true)
 
-        assertTrue(tracker.unavailable.value)
+        assertTrue(tracker.state.value.allBackendsUnavailable)
         tracker.report(requestId = 3L, available = true)
-        assertFalse(tracker.unavailable.value)
+        assertFalse(tracker.state.value.allBackendsUnavailable)
     }
 
     private fun snapshot(

@@ -114,7 +114,7 @@ private val clientRequestSequence = java.util.concurrent.atomic.AtomicLong()
 
 private suspend fun loadLatestRelease(): AppRelease? = withContext(Dispatchers.IO) {
     try {
-        backend.request(APP_LATEST_PATH, authenticated = false, trackAvailability = false).use { response ->
+        backend.request(APP_LATEST_PATH, authenticated = false).use { response ->
             if (!response.isSuccessful) return@withContext null
             val body = response.body.string()
             val json = JSONObject(body)
@@ -145,7 +145,7 @@ private fun MetricsApp(weatherViewModel: WeatherViewModel) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val lifecycle = (context as ComponentActivity).lifecycle
-    val allBackendsUnavailable by backend.allBackendsUnavailable.collectAsState()
+    val backendState by backend.state.collectAsState()
     var signedIn by remember { mutableStateOf(backend.hasStoredToken()) }
     val weatherState = weatherViewModel.state
     var activeDevice by remember { mutableStateOf(SensorDevice.Primary) }
@@ -266,7 +266,7 @@ private fun MetricsApp(weatherViewModel: WeatherViewModel) {
         LoginScreen(
             onPasswordLogin = { username, password ->
                 scope.launch {
-                    weatherViewModel.reset(WeatherState(loading = true))
+                    weatherViewModel.reset(WeatherState())
                     when (val result = loginWithPassword(username, password)) {
                         AuthResult.InvalidCredentials -> {
                             weatherViewModel.reset(WeatherState(error = "Неверный логин или пароль"))
@@ -285,7 +285,7 @@ private fun MetricsApp(weatherViewModel: WeatherViewModel) {
             },
             onGoogleLogin = { idToken ->
                 scope.launch {
-                    weatherViewModel.reset(WeatherState(loading = true))
+                    weatherViewModel.reset(WeatherState())
                     when (val result = loginWithGoogle(idToken)) {
                         AuthResult.Success -> {
                             weatherViewModel.reset()
@@ -305,12 +305,12 @@ private fun MetricsApp(weatherViewModel: WeatherViewModel) {
                 }
             },
             error = weatherState.error,
-            loading = weatherState.loading,
+            loading = backendState.isLoading,
         )
     } else {
         WeatherScreen(
             state = weatherState,
-            allBackendsUnavailable = allBackendsUnavailable,
+            backendState = backendState,
             showRequestLog = showRequestLog,
             onActiveDeviceChanged = { activeDevice = it },
         )
@@ -352,7 +352,7 @@ private fun MetricsApp(weatherViewModel: WeatherViewModel) {
                         onClick = {
                             scope.launch {
                                 try {
-                                    backend.request("/auth/logout", body = "", trackAvailability = false).close()
+                                    backend.request("/auth/logout", body = "").close()
                                 } catch (_: IOException) {
                                 } finally {
                                     backend.clearSession()
@@ -428,7 +428,7 @@ private fun VersionDialog(
 @Composable
 private fun WeatherScreen(
     state: WeatherState,
-    allBackendsUnavailable: Boolean,
+    backendState: BackendState,
     showRequestLog: Boolean,
     onActiveDeviceChanged: (SensorDevice) -> Unit,
 ) {
@@ -530,7 +530,7 @@ private fun WeatherScreen(
                     .fillMaxHeight(0.1f),
                 contentAlignment = Alignment.Center,
             ) {
-                if (allBackendsUnavailable) {
+                if (backendState.showSpinner) {
                     CircularProgressIndicator(color = Color(0xFFAAAAAA))
                 }
             }
@@ -975,7 +975,7 @@ private suspend fun loginWithPassword(username: String, password: String): AuthR
 
 private suspend fun exchangeToken(route: String, payload: String): AuthResult = withContext(Dispatchers.IO) {
     try {
-        backend.request(route, payload, authenticated = false, trackAvailability = false).use { response ->
+        backend.request(route, payload, authenticated = false).use { response ->
             when {
                 response.code == 401 || response.code == 403 -> AuthResult.InvalidCredentials
                 !response.isSuccessful -> AuthResult.Failure("Backend вернул HTTP ${response.code} при входе")
@@ -1085,7 +1085,6 @@ internal class WeatherViewModel : ViewModel() {
 
 internal data class WeatherState(
     val error: String? = null,
-    val loading: Boolean = false,
     val primaryCard: SensorCardState = SensorCardState(),
     val externalCard: SensorCardState = SensorCardState(),
     val requestLogs: List<ClientRequestLog> = emptyList(),

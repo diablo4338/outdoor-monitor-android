@@ -29,6 +29,7 @@ import java.io.IOException
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicLong
 import kotlin.coroutines.resumeWithException
+import kotlin.time.Duration
 import kotlin.time.Duration.Companion.milliseconds
 
 internal interface BackendTokenStore {
@@ -48,6 +49,7 @@ internal class BackendMiddleware(
         .addNetworkInterceptor(RequestTimingNetworkInterceptor())
         .build(),
     private val probeIntervalMillis: Long = 10_000,
+    private val retryDelays: List<Duration> = listOf(500.milliseconds, 1_000.milliseconds, 1_000.milliseconds),
 ) : Closeable {
     enum class Backend { Primary, Fallback }
 
@@ -68,10 +70,11 @@ internal class BackendMiddleware(
     private var probeJob: Job? = null
     private val availability = BackendAvailabilityTracker()
     private val requestSequence = AtomicLong()
-    val allBackendsUnavailable: StateFlow<Boolean> = availability.unavailable
+    val state: StateFlow<BackendState> = availability.state
 
     init {
         require(probeIntervalMillis > 0)
+        require(retryDelays.all { it >= Duration.ZERO && it.isFinite() })
     }
 
     fun switchBackend(backend: Backend): Unit = synchronized(lock) {
@@ -86,11 +89,15 @@ internal class BackendMiddleware(
             probeJob = scope.launch(start = CoroutineStart.LAZY) {
                 while (isActive) {
                     delay(probeIntervalMillis.milliseconds)
+                    val probeId = requestSequence.incrementAndGet()
                     try {
                         val healthy = send(Backend.Primary, "/health").use { it.isSuccessful }
                         if (healthy) {
                             synchronized(lock) {
-                                if (routingRevision == revision) switchBackend(Backend.Primary)
+                                if (routingRevision == revision) {
+                                    availability.report(probeId, true)
+                                    switchBackend(Backend.Primary)
+                                }
                             }
                             return@launch
                         }
@@ -107,36 +114,61 @@ internal class BackendMiddleware(
         body: String? = null,
         authenticated: Boolean = true,
         trace: RequestTimingTrace? = null,
-        trackAvailability: Boolean = true,
     ): Response = withContext(Dispatchers.IO) {
-        val requestId = requestSequence.incrementAndGet()
-        val (first, revision) = synchronized(lock) { active to routingRevision }
-        val candidates = if (first == Backend.Primary && Backend.Fallback in urls) {
-            listOf(first, Backend.Fallback)
-        } else listOf(first)
-        for ((index, backend) in candidates.withIndex()) {
-            try {
-                val token = synchronized(lock) { if (authenticated) tokens[backend] else null }
-                val response = send(backend, route, body, token, trace)
-                if (response.code !in 500..599) {
-                    if (trackAvailability) availability.report(requestId, true)
-                    return@withContext response
-                }
-                failOver(backend, revision)
-                if (index == candidates.lastIndex) {
-                    if (trackAvailability) availability.report(requestId, false)
-                    return@withContext response
-                }
-                response.close()
-            } catch (error: IOException) {
-                failOver(backend, revision)
-                if (index == candidates.lastIndex) {
-                    if (trackAvailability) availability.report(requestId, false)
-                    throw error
+        availability.requestStarted()
+        try {
+            val requestId = requestSequence.incrementAndGet()
+            val (first, revision) = synchronized(lock) { active to routingRevision }
+            val candidates = if (first == Backend.Primary && Backend.Fallback in urls) {
+                listOf(first, Backend.Fallback)
+            } else listOf(first)
+            for ((index, backend) in candidates.withIndex()) {
+                try {
+                    val token = synchronized(lock) { if (authenticated) tokens[backend] else null }
+                    val response = sendWithRetries(backend, route, body, token, trace)
+                    if (response.code !in 500..599) {
+                        availability.report(requestId, true)
+                        return@withContext response
+                    }
+                    failOver(backend, revision)
+                    if (index == candidates.lastIndex) {
+                        availability.report(requestId, false)
+                        return@withContext response
+                    }
+                    response.close()
+                } catch (error: IOException) {
+                    failOver(backend, revision)
+                    if (index == candidates.lastIndex) {
+                        availability.report(requestId, false)
+                        throw error
+                    }
                 }
             }
+            error("No backend candidates")
+        } finally {
+            availability.requestFinished()
         }
-        error("No backend candidates")
+    }
+
+    private suspend fun sendWithRetries(
+        backend: Backend,
+        route: String,
+        body: String?,
+        token: String?,
+        trace: RequestTimingTrace?,
+    ): Response {
+        for (attempt in 0..retryDelays.size) {
+            try {
+                val response = send(backend, route, body, token, trace)
+                // Authentication errors go straight to the caller; only outages are retried.
+                if (response.code !in 500..599 || attempt == retryDelays.size) return response
+                response.close()
+            } catch (error: IOException) {
+                if (attempt == retryDelays.size) throw error
+            }
+            delay(retryDelays[attempt])
+        }
+        error("Retry loop completed unexpectedly")
     }
 
     private fun failOver(backend: Backend, revision: Long) = synchronized(lock) {
@@ -227,15 +259,33 @@ internal class BackendMiddleware(
 
 private fun HttpUrl.origin(): String = "$scheme://$host:$port"
 
+internal data class BackendState(
+    val activeRequests: Int = 0,
+    val allBackendsUnavailable: Boolean = false,
+) {
+    val isLoading: Boolean get() = activeRequests > 0
+    val showSpinner: Boolean get() = isLoading || allBackendsUnavailable
+}
+
 internal class BackendAvailabilityTracker {
-    private val _unavailable = MutableStateFlow(false)
-    val unavailable: StateFlow<Boolean> = _unavailable
+    private val _state = MutableStateFlow(BackendState())
+    val state: StateFlow<BackendState> = _state
     private var lastRequestId = 0L
+
+    @Synchronized
+    fun requestStarted() {
+        _state.value = _state.value.copy(activeRequests = _state.value.activeRequests + 1)
+    }
+
+    @Synchronized
+    fun requestFinished() {
+        _state.value = _state.value.copy(activeRequests = _state.value.activeRequests - 1)
+    }
 
     @Synchronized
     fun report(requestId: Long, available: Boolean) {
         if (requestId < lastRequestId) return
         lastRequestId = requestId
-        _unavailable.value = !available
+        _state.value = _state.value.copy(allBackendsUnavailable = !available)
     }
 }
